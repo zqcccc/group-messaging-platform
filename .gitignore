@@ -1,0 +1,8 @@
+backend/dist
+dist/
+.DS_Store
+.env
+frontend/dist
+*.log
+mock-agent/dist
+node_modules/
