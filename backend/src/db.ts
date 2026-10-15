@@ -5,7 +5,7 @@ import { Pool } from 'pg';
 // 代码期望的 schema 版本；新增迁移时同步递增。
 export const CODE_SCHEMA_VERSION = 1;
 
-// 001 全量建表（CONTRACT.md 原样拷贝，全部 IF NOT EXISTS，可重复执行）。
+// 001 全量建表（全部 IF NOT EXISTS，可重复执行）。
 const MIGRATION_001 = `
 CREATE TABLE IF NOT EXISTS schema_migrations(version INT PRIMARY KEY, applied_at TIMESTAMPTZ DEFAULT now());
 CREATE TABLE IF NOT EXISTS accounts(

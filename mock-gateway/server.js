@@ -65,6 +65,7 @@ function defaultControl() {
     dropJoinAccounts: new Set(), // 指定账号 join 永不入群
     decisions: { accounts: {}, groups: {} }, // per account/group 强制错误，见下
     force503: false, // 所有端点 503
+    byClientId503: false, // 仅 by-client-id 查询 503（验证"查询不可用期间保持 unknown、不重发"）
     forceSend504All: false, // 所有 send 走 504 未知结果路径
     forceSend504Accounts: new Set(), // 指定账号 send 走 504
     send504Lands: true, // 504 后消息是否在 2s 内落地（false 则永不落地）
@@ -531,7 +532,7 @@ app.post('/groups/:id/send', (req, res) => {
 
 // ---------- 按 clientMsgId 查询 ----------
 app.get('/groups/:id/messages/by-client-id/:cid', (req, res) => {
-  if (ctl.force503) return err(res, 503, 'SERVICE_UNAVAILABLE', 'gateway temporarily unavailable');
+  if (ctl.force503 || ctl.byClientId503) return err(res, 503, 'SERVICE_UNAVAILABLE', 'gateway temporarily unavailable');
   if (!groups.has(req.params.id)) return err(res, 404, 'GROUP_NOT_FOUND', 'group not found');
   const list = byClient.get(req.params.cid);
   if (!list || list.length === 0) return err(res, 404, 'MESSAGE_NOT_FOUND', 'message not landed yet');
@@ -596,7 +597,7 @@ app.get('/events', (req, res) => {
 //                groups: { "<gid>": { code } | null } },
 //   rateLimit: { accountId, seconds },            // 立即限流该账号
 //   failSend: { accountId?, groupId?, code },     // 下一次投递转 message_failed（一次性）
-//   forceSend504All, forceKick504, send504Lands, force503, failNextLeave: bool,
+//   forceSend504All, forceKick504, send504Lands, force503, byClientId503, failNextLeave: bool,
 //   kickDelayMs, joinDelayMs, sendDelayMs, acceptDelayMs: number | [min,max],
 //   inviteReadyMs: number | [min,max] | "random", inviteTtlMs: number | null,
 //   setWritable: { groupId, writable },           // 群禁言/解散模拟
@@ -616,6 +617,7 @@ app.post('/__control', (req, res) => {
   setBool('outOfOrder');
   setBool('dropJoin');
   setBool('force503');
+  setBool('byClientId503');
   setBool('forceSend504All');
   setBool('forceKick504');
   setBool('send504Lands');

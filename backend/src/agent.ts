@@ -689,7 +689,13 @@ async function pickKickAccount(groupId: string): Promise<string | null> {
   return rows[0].account_id;
 }
 
+// agent 出站 clientMsgId：run 级命名空间 + idempotency_key。
+function agentClientMsgId(runId: string, key: string): string {
+  return `${runId}:${key}`;
+}
+
 async function execSend(
+  runId: string,
   groupId: string,
   gatewayGroupId: string,
   key: string,
@@ -698,6 +704,9 @@ async function execSend(
   history: unknown[],
 ): Promise<ToolExec | { blocked: true }> {
   const started = Date.now();
+  // clientMsgId 按 run 命名空间派生：幂等只在同一个 run 内成立（A5-7），
+  // 不同 run 复用同一个 key 不能互相吞消息；确定性派生保证重启后仍能查回同一行。
+  const cmid = agentClientMsgId(runId, key);
   // 幂等：同 run 同 key 第二次直接查出站行返当前状态（不发送不审计）。
   // AUDIT_REJECTED / POLICY_DENIED 拒绝的不记 key（execSend 只在通过后才记）。
   const knownClientMsgId = usedKeys[key];
@@ -706,10 +715,10 @@ async function execSend(
   }
   // 重启恢复：history 显示本 run 曾尝试过该 key（结果没落库），先查出站行，不盲目重发。
   if (hasUnresultedSend(history, key)) {
-    const row = await readOutboundByClientMsgId(key);
+    const row = await readOutboundByClientMsgId(cmid);
     if (row) {
-      usedKeys[key] = key;
-      return mapOutboundStatus(groupId, gatewayGroupId, key, Date.now() - started, false);
+      usedKeys[key] = cmid;
+      return mapOutboundStatus(groupId, gatewayGroupId, cmid, Date.now() - started, false);
     }
   }
   // 审计：text 原文；只有合法 JSON 且 verdict 恰为 pass 才执行。
@@ -719,12 +728,12 @@ async function execSend(
   // 执行账号：online 的群成员。
   const accountId = await pickSendAccount(groupId);
   if (!accountId) return errResult('NO_AVAILABLE_ACCOUNT', '群内没有 online 的服务账号可用', 'pass');
-  // idempotency_key 作 clientMsgId；确认预算 5 秒。
+  // run 内派生的 clientMsgId 作出站幂等键；确认预算 5 秒。
   const createOutbound = loadCreateOutbound();
   try {
     if (createOutbound) {
-      const result = await createOutbound(groupId, accountId, text, { idempotencyKey: key });
-      const clientMsgId = typeof result?.clientMsgId === 'string' && result.clientMsgId ? result.clientMsgId : key;
+      const result = await createOutbound(groupId, accountId, text, { idempotencyKey: cmid });
+      const clientMsgId = typeof result?.clientMsgId === 'string' && result.clientMsgId ? result.clientMsgId : cmid;
       usedKeys[key] = clientMsgId;
       return mapOutboundStatus(groupId, gatewayGroupId, clientMsgId, Date.now() - started, true);
     }
@@ -733,29 +742,29 @@ async function execSend(
       await getPool().query(
         `INSERT INTO outbound_messages(id, group_id, account_id, client_msg_id, text, delivery_status)
          VALUES ($1, $2, $3, $4, $5, 'queued')`,
-        [uuidv4(), groupId, accountId, key, text],
+        [uuidv4(), groupId, accountId, cmid, text],
       );
     } catch (e) {
       if (!isUniqueViolation(e)) throw e;
       // 该 key 已有出站行（崩溃前已落库）：直接按当前状态返回，不重发。
-      usedKeys[key] = key;
-      return mapOutboundStatus(groupId, gatewayGroupId, key, Date.now() - started, true);
+      usedKeys[key] = cmid;
+      return mapOutboundStatus(groupId, gatewayGroupId, cmid, Date.now() - started, true);
     }
     const outcome = await deliverMessage({
       groupId,
       gatewayGroupId,
       accountId,
       text,
-      clientMsgId: key,
+      clientMsgId: cmid,
       confirmMs: 5000,
     });
-    usedKeys[key] = key;
+    usedKeys[key] = cmid;
     switch (outcome.kind) {
       case 'sent':
         return {
           ok: true,
-          content: { clientMsgId: key, deliveryStatus: 'sent' },
-          summary: `send_message ok: clientMsgId=${key} deliveryStatus=sent`,
+          content: { clientMsgId: cmid, deliveryStatus: 'sent' },
+          summary: `send_message ok: clientMsgId=${cmid} deliveryStatus=sent`,
           auditVerdict: 'pass',
         };
       case 'group_forbidden':
@@ -781,10 +790,10 @@ async function execSend(
     if (code === 'ACCOUNT_SUSPENDED' || code === 'SESSION_EXPIRED' || code === 'ACCOUNT_TERMINAL') {
       return errResult('SEND_FAILED', '发送账号中途进入终态', 'pass');
     }
-    const row = await readOutboundByClientMsgId(key).catch(() => null);
+    const row = await readOutboundByClientMsgId(cmid).catch(() => null);
     if (row) {
-      usedKeys[key] = key;
-      return mapOutboundStatus(groupId, gatewayGroupId, key, Date.now() - started, true);
+      usedKeys[key] = cmid;
+      return mapOutboundStatus(groupId, gatewayGroupId, cmid, Date.now() - started, true);
     }
     return errResult('SEND_FAILED', `消息发送失败（${code ?? 'OUTBOUND_ERROR'}）`, 'pass');
   }
@@ -1201,7 +1210,7 @@ async function driveRun(runId: string): Promise<void> {
           await endRun(runId, 'cancelled', 'cancelled', '群不存在，run 取消', history, steps, consec, usedKeys, activeMs, stepCount);
           return;
         }
-        exec = await execSend(groupId, group.gatewayGroupId, String(input.idempotency_key), String(input.text), usedKeys, history);
+        exec = await execSend(runId, groupId, group.gatewayGroupId, String(input.idempotency_key), String(input.text), usedKeys, history);
       } else {
         const group = await loadGroup(groupId);
         if (!group) {

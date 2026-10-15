@@ -3,11 +3,13 @@
 // 实际发送复用 sequence.ts deliverMessage（含 504 确认与一次重发仲裁）。
 import { v4 as uuidv4 } from 'uuid';
 import { getPool } from './db';
-import { deliverMessage, pollLanding } from './sequence';
+import { deliverMessage, scheduleRateLimitRecovery, settleUnknown } from './sequence';
 import { emit } from './ws';
 
 export interface CreateOutboundOptions {
   idempotencyKey?: string;
+  // true：落行后立即返回（queued），网关调用与落地确认在后台进行（操作员发送接口用，202 不等 message_sent）。
+  detach?: boolean;
 }
 
 export interface OutboundResult {
@@ -36,11 +38,20 @@ export async function createOutbound(
   const key = opts && typeof opts.idempotencyKey === 'string' ? opts.idempotencyKey : undefined;
   const clientMsgId = key ? key : uuidv4();
   // 先落行（网关发出了、库里一定有记录）；同 key 重入时冲突忽略。
-  await pool.query(
+  const inserted = await pool.query(
     `INSERT INTO outbound_messages(id, group_id, account_id, client_msg_id, text, delivery_status)
      VALUES ($1, $2, $3, $4, $5, 'queued') ON CONFLICT (client_msg_id) DO NOTHING`,
     [uuidv4(), groupId, accountId, clientMsgId, text],
   );
+  if ((inserted.rowCount ?? 0) === 0) {
+    // 同 clientMsgId 的出站行已存在：不再调网关（网关不按 clientMsgId 去重，重发会多出一条），
+    // 直接返回该行当前状态。
+    const cur = await pool.query<{ delivery_status: string }>(
+      'SELECT delivery_status FROM outbound_messages WHERE client_msg_id = $1',
+      [clientMsgId],
+    );
+    return { clientMsgId, deliveryStatus: cur.rows[0]?.delivery_status ?? 'unknown' };
+  }
   const g = await pool.query<{ gateway_group_id: string }>('SELECT gateway_group_id FROM groups WHERE id = $1', [
     groupId,
   ]);
@@ -62,14 +73,21 @@ export async function createOutbound(
       return { clientMsgId, deliveryStatus: 'queued' };
     }
   }
-  const outcome = await deliverMessage({
+  const delivery = deliverMessage({
     groupId,
     gatewayGroupId,
     accountId,
     text,
     clientMsgId,
-    confirmMs: opts ? 5000 : 12000,
+    confirmMs: opts?.idempotencyKey ? 5000 : 12000,
   });
+  if (opts?.detach) {
+    delivery.catch((e: unknown) => {
+      console.error(`[send] 后台投递异常 clientMsgId=${clientMsgId}:`, e instanceof Error ? e.message : e);
+    });
+    return { clientMsgId, deliveryStatus: 'queued' };
+  }
+  const outcome = await delivery;
   return { clientMsgId, deliveryStatus: STATUS_BY_OUTCOME[outcome.kind] ?? 'queued' };
 }
 
@@ -94,6 +112,14 @@ export async function resumeOutbound(): Promise<void> {
       // 忽略。
     }
   }
+  // 窗口未过的限流账号：重新挂到期恢复定时器（进程重启后原定时器已丢失）。
+  const pendingLimited = await pool.query<{ id: string; until: Date }>(
+    `SELECT id, rate_limited_until AS until FROM accounts
+     WHERE status = 'rate_limited' AND rate_limited_until > now()`,
+  );
+  for (const row of pendingLimited.rows) {
+    scheduleRateLimitRecovery(row.id, new Date(row.until).getTime() - Date.now());
+  }
   const unk = await pool.query<{
     client_msg_id: string;
     group_id: string;
@@ -107,47 +133,29 @@ export async function resumeOutbound(): Promise<void> {
      WHERE ob.delivery_status = 'unknown'`,
   );
   for (const row of unk.rows) {
-    // 短窗确认：pollLanding 内部轮询网关 by-client-id（落地即有）。
-    let landed: { msgId: string; sentAt: string } | null = null;
-    try {
-      landed = await pollLanding(row.gateway_group_id, row.client_msg_id, 2000);
-    } catch {
-      continue; // 确认失败：保持 unknown，下次恢复再定。
-    }
-    if (landed) {
-      await pool.query(
-        `UPDATE outbound_messages SET delivery_status = 'sent', gateway_msg_id = $2, gateway_sent_at = $3
-         WHERE client_msg_id = $1`,
-        [row.client_msg_id, landed.msgId, landed.sentAt],
-      );
-      continue;
-    }
-    if (row.retry_count >= 1) {
-      await pool.query(
-        `UPDATE outbound_messages SET delivery_status = 'failed', fail_code = 'NETWORK_TIMEOUT'
-         WHERE client_msg_id = $1`,
-        [row.client_msg_id],
-      );
-      continue;
-    }
-    // 同 key 重发一次：走 deliverMessage 全流程（含各错误码收敛与 504 重发仲裁）。
-    try {
-      const outcome = await deliverMessage({
+    // 与运行时同一套收敛逻辑：查询不可用时保持 unknown（后台继续确认），确认没发出才重发/记 failed。
+    void settleUnknown(
+      {
         groupId: row.group_id,
         gatewayGroupId: row.gateway_group_id,
         accountId: row.account_id,
         text: row.text,
         clientMsgId: row.client_msg_id,
         confirmMs: 5000,
+      },
+      Date.now(),
+      5000,
+    )
+      .then(async (outcome) => {
+        if (outcome.kind === 'rate_limited') {
+          await pool.query(`UPDATE outbound_messages SET delivery_status = 'queued' WHERE client_msg_id = $1`, [
+            row.client_msg_id,
+          ]);
+        }
+      })
+      .catch(() => {
+        // 保持 unknown，下次恢复再定。
       });
-      if (outcome.kind === 'rate_limited') {
-        await pool.query(`UPDATE outbound_messages SET delivery_status = 'queued' WHERE client_msg_id = $1`, [
-          row.client_msg_id,
-        ]);
-      }
-    } catch {
-      // 重发异常：保持 unknown，下次恢复再定。
-    }
   }
 }
 

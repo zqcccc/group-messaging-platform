@@ -595,7 +595,7 @@ type CreateOutboundFn = (
   groupId: string,
   accountId: string,
   text: string,
-  opts?: { idempotencyKey?: string },
+  opts?: { idempotencyKey?: string; detach?: boolean },
 ) => Promise<OutboundResult>;
 
 // 出站流水线：send.ts 落地后用它的 createOutbound；落地前走本地最小实现
@@ -866,7 +866,7 @@ groupsRouter.post(
     try {
       const createOutbound = loadCreateOutbound();
       const result = createOutbound
-        ? await createOutbound(groupId, accountRaw, textRaw)
+        ? await createOutbound(groupId, accountRaw, textRaw, { detach: true })
         : await localCreateOutbound(groupId, gatewayGroupId, accountRaw, textRaw);
       res.status(202).json({ clientMsgId: result.clientMsgId });
     } catch (e) {

@@ -1,6 +1,49 @@
-# 多账号群组消息平台（exam）
+# 多账号群组消息平台
 
-后端（Node + TS + PostgreSQL）+ 操作控制台（React 18 + TS + Vite），对接消息网关与 Agent 服务（开发演示用 `mock-gateway` / `mock-agent` 模拟，接口与行为约定见 `mock-gateway/README.md`）。
+后端（Node + TS + PostgreSQL）+ 操作控制台（React 18 + TS + Vite），对接消息网关与 Agent 服务。开发和演示时由仓库内的 `mock-gateway` / `mock-agent` 模拟这两个服务（行为按题目 2.1 / 2.2 实现，带故障注入控制面）。
+
+**给检查者**：
+
+- [`docs/需求对照.md`](docs/需求对照.md)：逐条列出题目要求，标明实现位置、验证方式和完成状态（含未完成项与已知限制）。
+- [`verify/REPORT.md`](verify/REPORT.md)：`node verify/run-all.mjs` 生成的最近一次验收结果（S1–S8 + 补充用例）。
+- [`e2e/screenshots/`](e2e/screenshots/)：Playwright 端到端测试截下的控制台页面。
+
+## 快速开始（3 条命令）
+
+前置：Node 22+、Docker（只用来跑 PostgreSQL；本机已有 PG 的话改 `DATABASE_URL` 即可）。
+
+```bash
+docker compose up -d                 # PostgreSQL 16 → 127.0.0.1:15433（库/用户/密码 exam/exam/exam）
+scripts/start-all.sh --fresh         # 装依赖 + 构建 + 启动 mock-gateway / mock-agent / backend / 前端，--fresh 表示先清库
+node verify/run-all.mjs              # 一键跑 S1–S8 + 补充用例，打印结果并写 verify/REPORT.md
+```
+
+然后浏览器打开 <http://127.0.0.1:5173>，用 `admin/admin` 或 `viewer/viewer` 登录。停止服务：`scripts/stop-all.sh`；日志在 `.run/*.log`。
+
+> mock-gateway 是纯内存实现，重启后网关里的群和事件都会清空。重启它时请用 `--fresh` 一起清库，否则库里的群在网关里已不存在。
+
+## 自动化验收
+
+### `node verify/run-all.mjs`
+
+零依赖脚本（Node 22 自带 fetch / WebSocket），自己建数据：把 4 个账号都 connect → 建一个新群（acc-1 群主、acc-2 管理员、acc-3/acc-4 成员）→ 打开 agent → 逐条跑用例。可以重复运行（每次新建一个群），也可以只跑某几条：`node verify/run-all.mjs S4 X3`。
+
+| 用例 | 内容 |
+| ---- | ---- |
+| S1–S8 | 题目 2.4 的八个典型场景，通过网关和 agent 的 `/__control` 注入故障 |
+| X1 | 鉴权与错误体：401 / viewer 403 / health |
+| X2 | 账号状态机：404 / 400 / ILLEGAL_TRANSITION / CAS_CONFLICT / 并发转移，以及 WS `account_status_changed` 推送 |
+| X3 | 不同 agent run 复用同一个 `idempotency_key` 时，两条消息都要发出 |
+| X4 | 504 后 by-client-id 查询也不可用：保持 `unknown`、不重发，查询恢复后收敛 |
+
+### 端到端（C3，Playwright）
+
+```bash
+cd e2e && npm install && npx playwright install chromium   # 首次
+npx playwright test                                         # 登录 → 打开群 → 看 agent run 步骤；viewer 无写按钮
+```
+
+截图输出到 `e2e/screenshots/`，HTML 报告在 `e2e/report/`。
 
 ## 架构
 
@@ -32,7 +75,22 @@
 | backend 密钥 | `backend/`      | `JWT_SECRET`（生产必须设置，缺省为开发默认值）                                     | 未设置时 `exam-dev-secret-change-me`                                    |
 | frontend     | `frontend/`     | dev 端口 `5173`（`npm run dev -- --port XXX` 覆盖；被占时 vite 会自动顺延并打印实际端口） | `5173`                                                    |
 
-## 从零启动
+## 默认账号
+
+- `admin` / `admin`：全部权限（写操作可见）。
+- `viewer` / `viewer`：只读，所有写操作隐藏且直调接口返回 `403`。
+
+access token 有效期 15 分钟，过期前端自动用 HttpOnly cookie 续期（并发 401 只发一次 refresh，B3）。
+
+## 前端 5 页面操作路径（已对真实后端验证通过）
+
+1. 登录（`/login`）：`admin/admin` 登录；`viewer` 登录后写按钮全部隐藏。
+2. 账号列表（`/accounts`）：状态徽 + 限流倒计时；`online → 标记离线/释放账号`，`idle/disconnected → 重连`；终态置灰不可操作；CAS 冲突提示刷新。
+3. 群组（`/groups`）→ 群详情（`/groups/:id`）：建群表单（创建者 + 成员，异步 job 轮询）→ 成员列表（含 role 徽）→ 消息时间线（“加载更早”链式翻页、实时追加、自发消息 `deliveryStatus` 徽）→ 最近 agent run 列表（`blocked` 红底醒目）→ 群内发送 + `agentEnabled/autoKickEnabled` 开关。
+4. Agent 运行详情（`/agent-runs/:id`）：每步 `kind`/工具名/入参/`resultSummary`/审计结论/错误码；协议错误步可展开 2KB 原始响应。
+5. 序列运行（`/sequences`）：下拉选序列（`GET /api/sequences`），或用页内“新建序列”表单（`POST /api/sequences`）创建后自动选中 → 填 `vars`（JSON 或 `key=value` 每行）与 `stepVars`（JSON）→ 本地预检弹窗（每步 key 取值与 `default`/`step:N` 来源）→ 启动；缺 key 时后端 `422` 会显示 `stepIndex` 与 `key`；运行中进度条 + 每步状态/时间。
+
+## 手动逐个启动（不用脚本时）
 
 前置：Node 22+、Docker（跑 PG）。下面按顺序执行：
 
@@ -58,30 +116,3 @@ cd frontend && npm install && npm run dev
 ```
 
 注意：本机前端 dev 只监听 IPv6 回环，用 `http://localhost:5173` 访问（`http://127.0.0.1:5173` 不通是环境特性，非 bug）。
-
-## 默认账号
-
-- `admin` / `admin`：全部权限（写操作可见）。
-- `viewer` / `viewer`：只读，所有写操作隐藏且直调接口返回 `403`。
-
-access token 有效期 15 分钟，过期前端自动用 HttpOnly cookie 续期（并发 401 只发一次 refresh，B3）。
-
-## S1–S8 验证方法
-
-脚本与结果都在 `verify/`：`common.sh`（登录/网关与 Agent 控制面封装）、`s5.sh`–`s8.sh`（场景脚本）、`RESULTS.md`（逐项结果与证据，S1–S8 全 pass）。S1–S4 用网关 `POST /__control` 做故障注入（事件重复、回流、限流），S5–S6 用 Agent `POST /__control {script/reset}` 预设行为，S7 并发双启动看 `201` + `409`，S8 缺 key 启动看 `422 UNRESOLVED_PLACEHOLDER + stepIndex + key`。示例：
-
-```bash
-cd verify && ./s8.sh   # 第 3 步缺占位符 → 422，error.stepIndex=3，网关无新消息
-```
-
-## 前端 5 页面操作路径（已对真实后端验证通过）
-
-1. 登录（`/login`）：`admin/admin` 登录；`viewer` 登录后写按钮全部隐藏。
-2. 账号列表（`/accounts`）：状态徽 + 限流倒计时；`online → 标记离线/释放账号`，`idle/disconnected → 重连`；终态置灰不可操作；CAS 冲突提示刷新。
-3. 群组（`/groups`）→ 群详情（`/groups/:id`）：建群表单（创建者 + 成员，异步 job 轮询）→ 成员列表（含 role 徽）→ 消息时间线（“加载更早”链式翻页、实时追加、自发消息 `deliveryStatus` 徽）→ 最近 agent run 列表（`blocked` 红底醒目）→ 群内发送 + `agentEnabled/autoKickEnabled` 开关。
-4. Agent 运行详情（`/agent-runs/:id`）：每步 `kind`/工具名/入参/`resultSummary`/审计结论/错误码；协议错误步可展开 2KB 原始响应。
-5. 序列运行（`/sequences`）：后端无列表接口，下拉为空时手动填 `sequenceId`，或用页内“新建序列”表单（`POST /api/sequences`）创建后自动回填 → 填 `vars`（JSON 或 `key=value` 每行）与 `stepVars`（JSON）→ 本地预检弹窗（每步 key 取值与 `default`/`step:N` 来源）→ 启动；缺 key 时后端 `422` 会显示 `stepIndex` 与 `key`；运行中进度条 + 每步状态/时间。
-
-## 联调记录（2026-10-16）
-
-曾发现 WS 握手恒回 `{"type":"auth","success":false}`（后端 `ws.ts` 动态 require 的 `verifyAccessToken` 在 `auth.ts` 不存在）；本次已修复该后端问题并重启验证，浏览器实测导航栏 WS 显示“已连接”，实时推送链路恢复。无其他遗留已知问题。
