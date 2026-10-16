@@ -93,13 +93,20 @@ export async function applyRateLimited(accountId: string, retryAfterSeconds: num
   const from = String(cur.rows[0].status);
   if (from === 'suspended' || from === 'session_expired') return;
   const secs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0 ? Math.ceil(retryAfterSeconds) : 60;
-  await pool.query(
+  // 转移表上只有 online → rate_limited；已是 rate_limited 时只刷新 rateLimitedUntil（不算转移，不推事件）。
+  const upd = await pool.query(
     `UPDATE accounts SET status = 'rate_limited', rate_limited_until = now() + ($2 || ' seconds')::interval
-     WHERE id = $1 AND status NOT IN ('suspended', 'session_expired')`,
+     WHERE id = $1 AND status IN ('online', 'rate_limited')`,
     [accountId, String(secs)],
   );
-  await emitWs('account_status_changed', { accountId, from, to: 'rate_limited' });
-  // 到期恢复：只在仍是 rate_limited 且窗口已过时转回 online。
+  if ((upd.rowCount ?? 0) === 0) return;
+  if (from !== 'rate_limited') await emitWs('account_status_changed', { accountId, from, to: 'rate_limited' });
+  scheduleRateLimitRecovery(accountId, secs * 1000);
+}
+
+// 限流到期恢复：只在仍是 rate_limited 且窗口已过时转回 online，再按原顺序 flush 排队消息。
+// 重启后由 send.resumeOutbound 对窗口未过的账号重新挂上（定时器不随进程存活）。
+export function scheduleRateLimitRecovery(accountId: string, delayMs: number): void {
   setTimeout(() => {
     void (async () => {
       try {
@@ -125,7 +132,7 @@ export async function applyRateLimited(accountId: string, retryAfterSeconds: num
         // 恢复失败不抛，靠下次发送/轮询继续推进。
       }
     })();
-  }, secs * 1000 + 500);
+  }, Math.max(0, delayMs) + 500);
 }
 
 // 终态：复用 accounts.ts 的 CAS 转移（含清成员、取消排队发送、account_terminal 事件，同事务）。
@@ -257,18 +264,11 @@ export async function deliverMessage(args: {
       await pool.query(`UPDATE outbound_messages SET delivery_status = 'unknown' WHERE client_msg_id = $1`, [
         clientMsgId,
       ]);
-      // 2 秒窗口确认（网关保证 504 后 2 秒内收敛）。
-      const landed = await pollLanding(args.gatewayGroupId, clientMsgId, 2500);
-      if (landed) {
-        await markRowSent(clientMsgId, landed.msgId, landed.sentAt);
-        return { kind: 'sent', clientMsgId, msgId: landed.msgId, sentAt: landed.sentAt };
-      }
-      // 确认未发出且可重发：同 clientMsgId 重发一次。
-      if (await claimResend(clientMsgId)) {
-        return await deliverResend(args.groupId, args.gatewayGroupId, args.accountId, args.text, clientMsgId, confirmMs);
-      }
-      await markRowFailed(clientMsgId, 'NETWORK_TIMEOUT');
-      return { kind: 'failed', clientMsgId, code: 'NETWORK_TIMEOUT' };
+      return await settleUnknown(
+        { groupId: args.groupId, gatewayGroupId: args.gatewayGroupId, accountId: args.accountId, text: args.text, clientMsgId, confirmMs },
+        Date.now(),
+        Math.max(2500, Math.min(confirmMs, 5000)),
+      );
     }
     if (code === 'ACCOUNT_SUSPENDED' || code === 'SESSION_EXPIRED') {
       const terminal = code === 'ACCOUNT_SUSPENDED' ? 'suspended' : 'session_expired';
@@ -299,6 +299,74 @@ export async function deliverMessage(args: {
     return { kind: 'sent', clientMsgId, msgId: landed.msgId, sentAt: landed.sentAt };
   }
   return { kind: 'timeout', clientMsgId };
+}
+
+// 504 之后的确认：by-client-id 命中 → 已发出；504 起超过 2 秒仍明确 404 → 确认没发出；
+// 查询本身不可用（503/网络错误）不算 404，期间保持 unknown（A2：未确认没发出之前不能重发）。
+export async function confirmAfterTimeout(
+  gatewayGroupId: string,
+  clientMsgId: string,
+  timeoutAt: number,
+  maxWaitMs: number,
+): Promise<{ msgId: string; sentAt: string } | 'absent' | 'inconclusive'> {
+  const deadline = Date.now() + maxWaitMs;
+  for (;;) {
+    try {
+      const hit = await gwByClientId(gatewayGroupId, clientMsgId);
+      if (hit) return hit;
+      if (Date.now() - timeoutAt >= 2000) return 'absent';
+    } catch {
+      // 查询不可用：结论未知，继续等。
+    }
+    // 事件流已先一步收到 message_sent（出站行被 sse 置 sent）同样算已发出。
+    try {
+      const r = await getPool().query<{ gateway_msg_id: string | null; gateway_sent_at: Date | null }>(
+        `SELECT gateway_msg_id, gateway_sent_at FROM outbound_messages
+         WHERE client_msg_id = $1 AND delivery_status = 'sent' AND gateway_msg_id IS NOT NULL`,
+        [clientMsgId],
+      );
+      const row = r.rows[0];
+      if (row?.gateway_msg_id) {
+        return { msgId: row.gateway_msg_id, sentAt: (row.gateway_sent_at ?? new Date()).toISOString() };
+      }
+    } catch {
+      // 忽略，继续轮询。
+    }
+    if (Date.now() >= deadline) return 'inconclusive';
+    await sleep(200);
+  }
+}
+
+interface UnknownCtx {
+  groupId: string;
+  gatewayGroupId: string;
+  accountId: string;
+  text: string;
+  clientMsgId: string;
+  confirmMs: number;
+}
+
+// unknown 行收敛：落地 → sent；确认没发出 → 有额度则同 clientMsgId 重发一次，否则 failed(NETWORK_TIMEOUT)；
+// 查询不可用 → 保持 unknown 返回 timeout，并在后台继续确认（恢复后 2 秒内定状态）。
+export async function settleUnknown(ctx: UnknownCtx, timeoutAt: number, maxWaitMs: number): Promise<DeliveryOutcome> {
+  const r = await confirmAfterTimeout(ctx.gatewayGroupId, ctx.clientMsgId, timeoutAt, maxWaitMs);
+  if (r === 'inconclusive') {
+    if (maxWaitMs < 600000) {
+      void settleUnknown(ctx, timeoutAt, 600000).catch((e: unknown) => {
+        console.error(`[send] unknown 后台确认失败 clientMsgId=${ctx.clientMsgId}:`, e instanceof Error ? e.message : e);
+      });
+    }
+    return { kind: 'timeout', clientMsgId: ctx.clientMsgId };
+  }
+  if (r !== 'absent') {
+    await markRowSent(ctx.clientMsgId, r.msgId, r.sentAt);
+    return { kind: 'sent', clientMsgId: ctx.clientMsgId, msgId: r.msgId, sentAt: r.sentAt };
+  }
+  if (await claimResend(ctx.clientMsgId)) {
+    return await deliverResend(ctx.groupId, ctx.gatewayGroupId, ctx.accountId, ctx.text, ctx.clientMsgId, ctx.confirmMs);
+  }
+  await markRowFailed(ctx.clientMsgId, 'NETWORK_TIMEOUT');
+  return { kind: 'failed', clientMsgId: ctx.clientMsgId, code: 'NETWORK_TIMEOUT' };
 }
 
 // 同 clientMsgId 的重发（retry_count 已原子占用，这里只发一次，不再递归重发）。
@@ -344,8 +412,15 @@ async function deliverResend(
       return { kind: 'failed', clientMsgId, code };
     }
     if (code === 'NETWORK_TIMEOUT') {
-      await markRowFailed(clientMsgId, 'NETWORK_TIMEOUT');
-      return { kind: 'failed', clientMsgId, code: 'NETWORK_TIMEOUT' };
+      // 重发也 504：同样先确认再定（重发额度已用完，确认没发出才记 failed）。
+      await pool.query(`UPDATE outbound_messages SET delivery_status = 'unknown' WHERE client_msg_id = $1`, [
+        clientMsgId,
+      ]);
+      return await settleUnknown(
+        { groupId, gatewayGroupId, accountId, text, clientMsgId, confirmMs },
+        Date.now(),
+        Math.max(2500, Math.min(confirmMs, 5000)),
+      );
     }
     return { kind: 'retry_later', clientMsgId, code };
   }
@@ -926,6 +1001,18 @@ sequenceRouter.post(
     await emitSeqRun(runId, groupId, 'running', states[0].index);
     scheduleSeqStep(runId, states[0].index, now + states[0].delaySeconds * 1000);
     res.status(201).json({ runId });
+  }),
+);
+
+// GET /api/sequences → [{ id, name, steps }]（控制台序列页的下拉框用）。
+sequenceRouter.get(
+  '/sequences',
+  requireAuth,
+  asyncHandler(async (_req: Request, res: Response) => {
+    const { rows } = await getPool().query<{ id: string; name: string; steps: unknown }>(
+      'SELECT id, name, steps FROM sequences ORDER BY name, id',
+    );
+    res.json(rows.map((r) => ({ id: r.id, name: r.name, steps: Array.isArray(r.steps) ? r.steps : [] })));
   }),
 );
 

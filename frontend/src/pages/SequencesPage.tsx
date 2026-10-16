@@ -101,7 +101,7 @@ export default function SequencesPage() {
   const [run, setRun] = useState<SequenceRun | null>(null);
   const [startMsg, setStartMsg] = useState('');
 
-  // 后端无 GET /api/sequences 列表接口：404/405 时列表留空，允许手动填 sequenceId
+  // GET /api/sequences 拉序列列表；404/405（旧后端无列表接口）时列表留空，允许手动填 sequenceId
   const load = useCallback(async () => {
     try {
       const data = await fetchJson<Sequence[]>('/api/sequences');
@@ -282,7 +282,7 @@ export default function SequencesPage() {
             <input value={manualSeqId} onChange={(e) => { setManualSeqId(e.target.value); setSeqId(''); }} placeholder="粘贴 POST /api/sequences 返回的 id，或下方新建" style={{ flex: 1 }} />
           </div>
         )}
-        {!isViewer && sequences.length === 0 && (
+        {!isViewer && (
           <div className="card" style={{ marginTop: 8 }}>
             <h4>新建序列（POST /api/sequences）</h4>
             <div className="form-row">

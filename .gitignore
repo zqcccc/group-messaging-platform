@@ -6,3 +6,7 @@ frontend/dist
 *.log
 mock-agent/dist
 node_modules/
+.run/
+verify/evidence-*.log
+e2e/test-results/
+e2e/report/

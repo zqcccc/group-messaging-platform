@@ -45,6 +45,11 @@ export async function applyAccountTransition(
       await client.query('ROLLBACK');
       return { ok: false, error: 'CAS_CONFLICT' };
     }
+    // 状态事件与状态同事务落库（A1：推给前端的状态事件必须对应已保存的状态），由 WS broadcaster 推送。
+    await client.query('INSERT INTO ws_events(type, payload) VALUES ($1, $2)', [
+      'account_status_changed',
+      { accountId: id, from: expectedFrom, to },
+    ]);
     if (TERMINAL_STATUSES[to]) {
       await client.query('DELETE FROM group_members WHERE account_id = $1', [id]);
       await client.query(
@@ -169,10 +174,33 @@ accountsRouter.post(
       sendError(req, res, 502, 'GATEWAY_UNAVAILABLE', '网关响应缺少 platformUserId');
       return;
     }
-    await getPool().query(
-      'UPDATE accounts SET platform_user_id = $2, status = $3, version = version + 1 WHERE id = $1',
-      [id, platformUserId, 'online'],
-    );
+    // CAS：只在状态仍是 connect 前读到的值时生效，并与 account_status_changed 事件同事务落库。
+    const client = await getPool().connect();
+    try {
+      await client.query('BEGIN');
+      const upd = await client.query(
+        `UPDATE accounts SET platform_user_id = $2, status = 'online', version = version + 1
+         WHERE id = $1 AND status = $3`,
+        [id, platformUserId, status],
+      );
+      if ((upd.rowCount ?? 0) === 0) {
+        await client.query('ROLLBACK');
+        sendError(req, res, 409, 'CAS_CONFLICT', `账号状态在 connect 期间已变化（原为 ${status}）`);
+        return;
+      }
+      if (status !== 'online') {
+        await client.query('INSERT INTO ws_events(type, payload) VALUES ($1, $2)', [
+          'account_status_changed',
+          { accountId: id, from: status, to: 'online' },
+        ]);
+      }
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw e;
+    } finally {
+      client.release();
+    }
     res.json({ status: 'online', platformUserId });
   }),
 );

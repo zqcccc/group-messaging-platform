@@ -1,0 +1,15 @@
+# 只起 PostgreSQL（应用进程用 scripts/start-all.sh 启动）。
+services:
+  postgres:
+    image: postgres:16
+    container_name: exam-pg
+    environment:
+      POSTGRES_USER: exam
+      POSTGRES_PASSWORD: exam
+      POSTGRES_DB: exam
+    ports:
+      - "127.0.0.1:15433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U exam -d exam"]
+      interval: 2s
+      retries: 15
