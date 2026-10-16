@@ -3,6 +3,7 @@
 import { Request, Response, Router } from 'express';
 import { requireAuth } from './auth';
 import { getPool } from './db';
+import { publicDeliveryStatus } from './send';
 import { asyncHandler, sendError } from './util';
 
 interface TimelineItem {
@@ -162,7 +163,7 @@ messagesRouter.get(
         isOwn: true,
         text: o.text,
         sentAt,
-        deliveryStatus: o.delivery_status,
+        deliveryStatus: publicDeliveryStatus(o.delivery_status),
         // failed/cancelled 必有 failCode：库里缺失时兜底 UNKNOWN（输出契约优先）。
         failCode: o.fail_code ?? (needsCode ? 'UNKNOWN' : null),
       });

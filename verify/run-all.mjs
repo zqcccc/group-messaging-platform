@@ -2,11 +2,13 @@
 // 一键验收：自建账号/群 → 逐条跑 S1–S8 与若干补充用例 → 终端打印结果表，并写 verify/REPORT.md。
 // 零依赖（Node 22+ 自带 fetch / WebSocket）。前置：mock-gateway、mock-agent、backend 已启动。
 //
-//   node verify/run-all.mjs            # 全部
+//   node verify/run-all.mjs            # 全部（不含需显式点名的用例）
 //   node verify/run-all.mjs S4 X3      # 只跑指定用例
+//   node verify/run-all.mjs X6         # 会把 acc-3 永久变成终态，只在点名时跑，跑完需 --fresh 重启
 //
 // 地址可用环境变量覆盖：BACKEND / GW / AG（默认 :3001 / :3101 / :3102）。
-import { writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { existsSync, openSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -155,7 +157,39 @@ function openWs(token) {
 // ---------- 用例 ----------
 // 每个用例返回 checks: [{ name, ok, detail }]。
 const cases = [];
-const def = (id, title, req, fn) => cases.push({ id, title, req, fn });
+const def = (id, title, req, fn, opts = {}) => cases.push({ id, title, req, fn, optIn: !!opts.optIn });
+
+// 重启后端（kill -9 模拟崩溃）：只支持 scripts/start-all.sh 启动的后端（.run/backend.pid）。
+const RUN = join(HERE, '..', '.run');
+async function healthy() {
+  try {
+    return (await fetch(`${BACKEND}/api/health`)).ok;
+  } catch {
+    return false;
+  }
+}
+async function crashAndRestartBackend() {
+  const pidFile = join(RUN, 'backend.pid');
+  if (!existsSync(pidFile)) throw new Error('找不到 .run/backend.pid（需用 scripts/start-all.sh 启动后端）');
+  process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGKILL');
+  await waitFor(async () => !(await healthy()), 5000, 100);
+  const log = openSync(join(RUN, 'backend.log'), 'a');
+  const child = spawn('node', ['dist/index.js'], {
+    cwd: join(HERE, '..', 'backend'),
+    detached: true,
+    stdio: ['ignore', log, log],
+    env: {
+      ...process.env,
+      PORT: new URL(BACKEND).port || '3001',
+      DATABASE_URL: process.env.DATABASE_URL ?? 'postgres://exam:exam@127.0.0.1:15433/exam',
+      GATEWAY_URL: GW,
+      AGENT_URL: AG,
+    },
+  });
+  child.unref();
+  writeFileSync(pidFile, String(child.pid));
+  if (!(await waitFor(healthy, 20000, 200))) throw new Error('后端重启后 20 秒内未就绪');
+}
 
 def('S1', '受理与发出', '2.4 S1 / A2', async () => {
   await gw({ sendDelayMs: [2500, 2500] }); // 拉长 202 → message_sent 的间隔，便于观察 accepted
@@ -407,6 +441,72 @@ def('X4', '504 期间 by-client-id 不可用', 'A2', async () => {
   ];
 });
 
+def('X5', '崩溃恢复：网关受理途中进程被杀', 'A2 / 总则', async () => {
+  // 202 拉长到 2 秒，在后端等 202 的途中 kill -9：网关照样受理并落地，库里那一行停在发送中。
+  // 重启后必须确认到它已发出（不能卡在 queued，也不能因为没确认就重发出第二条）。
+  await gw({ acceptDelayMs: [2000, 2000], sendDelayMs: [1500, 1500] });
+  const since = await gwEventCursor();
+  const r = await api('POST', `/api/groups/${ctx.group}/send`, { accountId: 'acc-2', text: `X5 ${uniq()}` });
+  const cmid = r.body?.clientMsgId;
+  await sleep(500);
+  const before = (await timeline()).find((m) => m.clientMsgId === cmid)?.deliveryStatus;
+  await crashAndRestartBackend();
+  await gw({ acceptDelayMs: [0, 300], sendDelayMs: [50, 2000] });
+  const final = await waitFor(async () => {
+    const row = (await timeline()).find((m) => m.clientMsgId === cmid);
+    return row?.deliveryStatus === 'sent' ? row : null;
+  }, 15000, 300);
+  await sleep(3000); // 留出误重发的时间窗
+  const sends = (await gwEvents(since)).filter((e) => e.type === 'message_sent' && e.clientMsgId === cmid);
+  return [
+    { name: '崩溃前对外显示 queued（内部为发送中）', ok: before === 'queued', detail: before },
+    { name: '重启后收敛为 sent', ok: !!final, detail: final?.deliveryStatus ?? (await timeline()).find((m) => m.clientMsgId === cmid)?.deliveryStatus },
+    { name: '网关里恰好 1 条（没有误重发）', ok: sends.length === 1, detail: `message_sent=${sends.length}` },
+  ];
+});
+
+def('X6', '终态账号的序列步骤同事务 skipped', 'A1 / B1', async () => {
+  // acc-3 是群里按字典序第一个 member：第 1 步由它发，网关回 429 → 该步带着排队的出站行顺延 60 秒。
+  // 这时网关推 account_status: suspended：出站行 cancelled、该步 skipped 必须立即同时生效，第 2 步随即由 acc-4 发出。
+  const acc = 'acc-3';
+  await gw({ rateLimit: { accountId: acc, seconds: 60 } });
+  const seq = await api('POST', '/api/sequences', {
+    name: `x6-${uniq()}`,
+    steps: [
+      { index: 1, accountRole: 'member', text: 'X6 one', delaySeconds: 0 },
+      { index: 2, accountRole: 'member', text: 'X6 two', delaySeconds: 1 },
+    ],
+  });
+  const start = await api('POST', `/api/groups/${ctx.group}/sequence-runs`, { sequenceId: seq.body.id, vars: {}, stepVars: {} });
+  const runId = start.body?.runId;
+  const getRun = async () => (await api('GET', `/api/sequence-runs/${runId}`)).body;
+  const waiting = await waitFor(async () => {
+    const run = await getRun();
+    return (await accountStatus(acc)) === 'rate_limited' && run?.steps?.[0]?.clientMsgId ? run : null;
+  }, 10000, 200);
+  const cmid = waiting?.steps?.[0]?.clientMsgId;
+  const t0 = Date.now();
+  await gw({ accountStatus: { accountId: acc, status: 'suspended' } });
+  const skipped = await waitFor(async () => {
+    const run = await getRun();
+    return run?.steps?.[0]?.status === 'skipped' ? run : null;
+  }, 5000, 100);
+  const skipMs = Date.now() - t0;
+  const row = (await timeline()).find((m) => m.clientMsgId === cmid);
+  const done = await waitFor(async () => {
+    const run = await getRun();
+    return run?.status !== 'running' ? run : null;
+  }, 15000, 300);
+  const [s1, s2] = done?.steps ?? [];
+  const gap = s1?.sentAt && s2?.sentAt ? Date.parse(s2.sentAt) - Date.parse(s1.sentAt) : NaN;
+  return [
+    { name: '第 1 步因限流带着排队消息顺延', ok: !!cmid, detail: waiting?.steps?.[0]?.status },
+    { name: '账号终态后该步立即 skipped（不等到限流到期）', ok: !!skipped && skipMs < 3000, detail: `${skipMs}ms` },
+    { name: '对应出站行 cancelled / ACCOUNT_TERMINAL', ok: row?.deliveryStatus === 'cancelled' && row?.failCode === 'ACCOUNT_TERMINAL', detail: `${row?.deliveryStatus}/${row?.failCode}` },
+    { name: '第 2 步在跳过时刻 + 1 秒后发出，运行 finished', ok: done?.status === 'finished' && s2?.status === 'sent' && gap >= 1000 && gap < 10000, detail: `${done?.status} gap=${gap}ms` },
+  ];
+}, { optIn: true });
+
 // ---------- 主流程 ----------
 async function preflight() {
   const targets = [
@@ -453,7 +553,7 @@ let seenGroups = new Set();
 
 async function main() {
   const only = new Set(process.argv.slice(2).map((s) => s.toUpperCase()));
-  const selected = only.size ? cases.filter((c) => only.has(c.id)) : cases;
+  const selected = only.size ? cases.filter((c) => only.has(c.id)) : cases.filter((c) => !c.optIn);
   await preflight();
   ctx.token = (await http(BACKEND, 'POST', '/api/auth/login', { username: 'admin', password: 'admin' })).body?.accessToken;
   seenGroups = new Set(((await api('GET', '/api/groups')).body ?? []).map((g) => g.id));

@@ -1,6 +1,6 @@
 // pg 连接池 + 001 迁移（幂等）+ 启动时 schema 版本校验 + seed 数据兜底。
 import bcrypt from 'bcryptjs';
-import { Pool } from 'pg';
+import { Pool, PoolClient } from 'pg';
 
 // 代码期望的 schema 版本；新增迁移时同步递增。
 export const CODE_SCHEMA_VERSION = 1;
@@ -75,6 +75,22 @@ export function getPool(): Pool {
     pool = new Pool({ connectionString: process.env.DATABASE_URL });
   }
   return pool;
+}
+
+// 在一个事务里执行 fn：正常返回即 COMMIT，抛错则 ROLLBACK 后原样上抛。
+export async function withTransaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
+  const client = await getPool().connect();
+  try {
+    await client.query('BEGIN');
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw e;
+  } finally {
+    client.release();
+  }
 }
 
 // 执行迁移：整段 001 在一个事务里跑，版本号缺失才补记。

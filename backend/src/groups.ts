@@ -1,193 +1,23 @@
 // 群组面：建群 job、leave-all job、jobs 查询、群查询/PATCH、群内 send。
-// 网关调用走本文件最小客户端（与 gateway.ts 同错误形状，落地后可整体替换 gwFetch 一层）。
-// 成员事件等待以轮询网关 members 为主；sse.ts 落地后顺带订阅做提前唤醒（动态加载，不存在即走纯轮询）。
+// 成员事件等待以轮询网关 members 为主，订阅 sse 成员事件做提前唤醒。
 import { Request, Response, Router } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import { requireAdmin, requireAuth } from './auth';
 import { getPool } from './db';
+import { gwCreateGroup, gwInvite, gwJoin, gwLeave, gwMembers, gwPromote } from './gateway';
+import { createOutbound } from './send';
+import { subscribeMemberEvents } from './sse';
 import { asyncHandler, sendError } from './util';
-
-// ---------- 网关最小客户端 ----------
-
-// 网关失败（HTTP 非 2xx 或不可达），code 取自 { error: { code } } / { code }。
-class GwError extends Error {
-  httpStatus: number;
-  code: string;
-  retryAfterSeconds?: number;
-  constructor(httpStatus: number, code: string, message: string, retryAfterSeconds?: number) {
-    super(message);
-    this.httpStatus = httpStatus;
-    this.code = code;
-    this.retryAfterSeconds = retryAfterSeconds;
-  }
-}
-
-// 网关错误码：兼容 { error: { code } } 与 { code } 两种形状。
-function gwBodyCode(data: unknown): string | undefined {
-  if (typeof data !== 'object' || data === null) return undefined;
-  if ('code' in data && typeof data.code === 'string') return data.code;
-  if ('error' in data && typeof data.error === 'object' && data.error !== null) {
-    const inner = data.error;
-    if ('code' in inner && typeof inner.code === 'string') return inner.code;
-  }
-  return undefined;
-}
-
-// 429 携带的 retryAfterSeconds（在 { error: {...} } 里）。
-function readRetryAfterSeconds(data: unknown): number | undefined {
-  if (typeof data !== 'object' || data === null || !('error' in data)) return undefined;
-  const inner = data.error;
-  if (typeof inner !== 'object' || inner === null || !('retryAfterSeconds' in inner)) return undefined;
-  return typeof inner.retryAfterSeconds === 'number' ? inner.retryAfterSeconds : undefined;
-}
-
-// 网关请求：默认 15s 超时；非 2xx 抛 GwError；连不上抛 code=GATEWAY_UNREACHABLE 的 GwError。
-async function gwFetch(method: string, path: string, body?: unknown, timeoutMs = 15000): Promise<unknown> {
-  const base = (process.env.GATEWAY_URL ?? '').replace(/\/+$/, '');
-  if (!base) throw new GwError(0, 'GATEWAY_NOT_CONFIGURED', '缺少环境变量 GATEWAY_URL');
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    const res = await fetch(base + path, {
-      method,
-      headers: { 'content-type': 'application/json' },
-      body: body === undefined ? undefined : JSON.stringify(body),
-      signal: ctrl.signal,
-    });
-    const data: unknown = await res.json().catch(() => null);
-    if (!res.ok) {
-      const code = gwBodyCode(data) ?? `HTTP_${res.status}`;
-      throw new GwError(res.status, code, `网关请求失败 ${method} ${path}: ${code}`, readRetryAfterSeconds(data));
-    }
-    return data;
-  } catch (e) {
-    if (e instanceof GwError) throw e;
-    const detail = e instanceof Error ? e.message : '未知错误';
-    throw new GwError(0, 'GATEWAY_UNREACHABLE', `网关不可达 ${method} ${path}: ${detail}`);
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-// 建群响应提取 groupId（形状不对抛 BAD_GATEWAY_RESPONSE，调用方记 step=create）。
-function parseGroupId(data: unknown): string {
-  if (typeof data === 'object' && data !== null && 'groupId' in data) {
-    if (typeof data.groupId === 'string' && data.groupId.length > 0) return data.groupId;
-  }
-  throw new GwError(200, 'BAD_GATEWAY_RESPONSE', '建群响应缺 groupId');
-}
-
-// 邀请响应提取链接与就绪延迟。
-function parseInvite(data: unknown): { inviteLink: string; readyAfterMs: number } {
-  if (typeof data === 'object' && data !== null && 'inviteLink' in data) {
-    if (typeof data.inviteLink === 'string' && data.inviteLink.length > 0) {
-      const raw = 'readyAfterMs' in data ? data.readyAfterMs : 0;
-      return { inviteLink: data.inviteLink, readyAfterMs: typeof raw === 'number' && raw > 0 ? raw : 0 };
-    }
-  }
-  throw new GwError(200, 'BAD_GATEWAY_RESPONSE', '邀请响应缺 inviteLink');
-}
-
-// 成员列表提取 platformUserId 数组（非数组抛 BAD_GATEWAY_RESPONSE，单条坏数据跳过）。
-function parseMembers(data: unknown): string[] {
-  if (!Array.isArray(data)) throw new GwError(200, 'BAD_GATEWAY_RESPONSE', '成员列表响应非法');
-  const out: string[] = [];
-  for (const item of data) {
-    if (typeof item === 'object' && item !== null && 'platformUserId' in item) {
-      if (typeof item.platformUserId === 'string') out.push(item.platformUserId);
-    }
-  }
-  return out;
-}
-
-async function gwCreateGroup(creatorAccountId: string): Promise<string> {
-  return parseGroupId(await gwFetch('POST', '/groups', { creatorAccountId }));
-}
-
-async function gwInvite(gatewayGroupId: string): Promise<{ inviteLink: string; readyAfterMs: number }> {
-  return parseInvite(await gwFetch('POST', `/groups/${gatewayGroupId}/invite`, {}));
-}
-
-async function gwJoin(gatewayGroupId: string, accountId: string, inviteLink: string): Promise<void> {
-  await gwFetch('POST', `/groups/${gatewayGroupId}/join`, { accountId, inviteLink });
-}
-
-async function gwPromote(gatewayGroupId: string, byAccountId: string, accountId: string): Promise<void> {
-  await gwFetch('POST', `/groups/${gatewayGroupId}/promote`, { byAccountId, accountId });
-}
-
-async function gwLeave(gatewayGroupId: string, accountId: string): Promise<void> {
-  await gwFetch('POST', `/groups/${gatewayGroupId}/leave`, { accountId });
-}
-
-async function gwMembers(gatewayGroupId: string): Promise<string[]> {
-  return parseMembers(await gwFetch('GET', `/groups/${gatewayGroupId}/members`));
-}
+import { emitInconsistency } from './ws';
 
 function sleep(ms: number): Promise<void> {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
-// catch 捕获的未知错误转网关业务码（GwError 与 gateway.ts 的 GatewayError 都有 code 字段）。
+// catch 捕获的未知错误转网关业务码（GatewayError 及带 code 的业务错误）。
 function thrownCode(e: unknown): string | undefined {
-  if (e instanceof GwError) return e.code;
   if (typeof e === 'object' && e !== null && 'code' in e && typeof e.code === 'string') return e.code;
   return undefined;
-}
-
-// ---------- 可选的外部模块（存在即用，不存在走本地兜底，保证随时可构建运行） ----------
-
-// sse 成员事件（与 sse.ts 导出形状一致）。
-interface SseMemberEvent {
-  gatewayGroupId: string;
-  platformUserId: string;
-  kind: string;
-}
-
-type SseSubscribeFn = (fn: (ev: SseMemberEvent) => void) => () => void;
-
-// sse.ts 动态加载：文件不存在时抛错，调用方捕获后走纯轮询（保持本模块独立可构建）。
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-function loadSseModule(): unknown {
-  return require('./sse.js');
-}
-
-// 已确认为函数的 subscribeMemberEvents 转为内部签名（动态模块形参无法再做 schema 校验）。
-function asSseSubscribe(mod: object): SseSubscribeFn | null {
-  if (!('subscribeMemberEvents' in mod) || typeof mod.subscribeMemberEvents !== 'function') return null;
-  const subscribe = mod.subscribeMemberEvents as unknown as SseSubscribeFn;
-  return subscribe;
-}
-
-// sse 订阅转内部唤醒回调；加载失败/签名不符返回 null，调用方走纯轮询。
-function subscribeMemberWakeup(
-  cb: (gatewayGroupId: string, platformUserId: string, kind: 'joined' | 'left') => void,
-): (() => void) | null {
-  let mod: unknown;
-  try {
-    mod = loadSseModule();
-  } catch {
-    return null;
-  }
-  if (typeof mod !== 'object' || mod === null) return null;
-  const subscribe = asSseSubscribe(mod);
-  if (!subscribe) return null;
-  try {
-    const off: unknown = subscribe((ev) => {
-      if (
-        typeof ev.gatewayGroupId === 'string' &&
-        typeof ev.platformUserId === 'string' &&
-        (ev.kind === 'joined' || ev.kind === 'left')
-      ) {
-        cb(ev.gatewayGroupId, ev.platformUserId, ev.kind);
-      }
-    });
-    if (typeof off !== 'function') return null;
-    const unsub = off as unknown as () => void;
-    return unsub;
-  } catch {
-    return null;
-  }
 }
 
 // 等网关成员出现/消失：轮询 members 为主（网关先改列表后推事件，轮询最可靠），
@@ -199,8 +29,10 @@ async function waitForGatewayMember(
   timeoutMs: number,
 ): Promise<boolean> {
   let hinted = false;
-  const unsub = subscribeMemberWakeup((gid, pu, kind) => {
-    if (gid === gatewayGroupId && pu === platformUserId && (kind === 'joined') === present) hinted = true;
+  const unsub = subscribeMemberEvents((ev) => {
+    if (ev.gatewayGroupId === gatewayGroupId && ev.platformUserId === platformUserId && (ev.kind === 'joined') === present) {
+      hinted = true;
+    }
   });
   try {
     const deadline = Date.now() + timeoutMs;
@@ -224,11 +56,7 @@ async function waitForGatewayMember(
       await sleep(250);
     }
   } finally {
-    try {
-      unsub?.();
-    } catch {
-      // 取消订阅失败不影响结果。
-    }
+    unsub();
   }
 }
 
@@ -468,13 +296,6 @@ async function checkMembersConsistency(groupId: string, gatewayGroupId: string):
   return problems.length > 0 ? problems.join(',') : null;
 }
 
-async function emitInconsistency(kind: string, ref: string, message: string): Promise<void> {
-  await getPool().query('INSERT INTO ws_events(type, payload) VALUES ($1, $2)', [
-    'inconsistency',
-    { kind, ref, message },
-  ]);
-}
-
 // leave-all：非群主先退（失败记 errors 继续、群主不退、job failed，失败账号两边仍是成员），
 // 群主最后退；完成后做 DB 与网关成员一致性校验，不一致记 inconsistency。
 async function runLeaveAllJob(jobId: string, groupId: string, gatewayGroupId: string): Promise<void> {
@@ -585,85 +406,6 @@ async function loadGroupView(groupId: string): Promise<Record<string, unknown> |
 }
 
 // ---------- 群内 send（走出站流水线） ----------
-
-interface OutboundResult {
-  clientMsgId: string;
-  deliveryStatus: string;
-}
-
-type CreateOutboundFn = (
-  groupId: string,
-  accountId: string,
-  text: string,
-  opts?: { idempotencyKey?: string; detach?: boolean },
-) => Promise<OutboundResult>;
-
-// 出站流水线：send.ts 落地后用它的 createOutbound；落地前走本地最小实现
-//（先落 queued 行再调网关，能覆盖联调与验收；queued/unknown 行由 send.ts 落地后接管）。
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-function loadSendModule(): unknown {
-  return require('./send.js');
-}
-
-function loadCreateOutbound(): CreateOutboundFn | null {
-  let mod: unknown;
-  try {
-    mod = loadSendModule();
-  } catch {
-    return null; // send.ts 未落地：调用方走本地最小实现。
-  }
-  if (typeof mod !== 'object' || mod === null || !('createOutbound' in mod)) return null;
-  if (typeof mod.createOutbound !== 'function') return null;
-  // 已确认为函数；签名按 send.ts 约定转接（动态模块形参无法再校验）。
-  const fn = mod.createOutbound as unknown as CreateOutboundFn;
-  return fn;
-}
-
-// 本地最小出站：先落 queued 行（网关发出了、库里一定有记录），再调网关。
-// rate_limited 不调网关（保持 queued，到期由流水线按顺序发出）；
-// 限流窗口内调网关会重置计时，故这里先查状态。
-// 同步网关错误按 A2 落行（SENDER_NOT_IN_GROUP 等只记 failed，不抛给调用方改 409）。
-async function localCreateOutbound(
-  groupId: string,
-  gatewayGroupId: string,
-  accountId: string,
-  text: string,
-): Promise<OutboundResult> {
-  const pool = getPool();
-  const clientMsgId = uuidv4();
-  const id = uuidv4();
-  await pool.query(
-    `INSERT INTO outbound_messages(id, group_id, account_id, client_msg_id, text, delivery_status)
-     VALUES ($1, $2, $3, $4, $5, 'queued')`,
-    [id, groupId, accountId, clientMsgId, text],
-  );
-  async function mark(status: string, failCode: string | null): Promise<OutboundResult> {
-    if (failCode === null) {
-      await pool.query(
-        `UPDATE outbound_messages SET delivery_status = $2, accepted_at = now() WHERE client_msg_id = $1`,
-        [clientMsgId, status],
-      );
-    } else {
-      await pool.query(`UPDATE outbound_messages SET delivery_status = $2, fail_code = $3 WHERE client_msg_id = $1`, [
-        clientMsgId,
-        status,
-        failCode,
-      ]);
-    }
-    return { clientMsgId, deliveryStatus: status };
-  }
-  const acc = await pool.query<{ status: string }>('SELECT status FROM accounts WHERE id = $1', [accountId]);
-  if (acc.rows.length > 0 && acc.rows[0].status === 'rate_limited') return { clientMsgId, deliveryStatus: 'queued' };
-  try {
-    await gwFetch('POST', `/groups/${gatewayGroupId}/send`, { accountId, clientMsgId, text }, 20000);
-    return await mark('accepted', null);
-  } catch (e) {
-    const code = thrownCode(e) ?? 'NETWORK_ERROR';
-    if (code === 'RATE_LIMITED') return { clientMsgId, deliveryStatus: 'queued' }; // 保持 queued。
-    if (code === 'NETWORK_TIMEOUT') return await mark('unknown', null); // 由流水线 5s 内确认。
-    return await mark('failed', code);
-  }
-}
 
 // ---------- 路由 ----------
 
@@ -836,14 +578,11 @@ groupsRouter.post(
       return;
     }
     const pool = getPool();
-    const g = await pool.query<{ gateway_group_id: string }>('SELECT gateway_group_id FROM groups WHERE id = $1', [
-      groupId,
-    ]);
+    const g = await pool.query('SELECT 1 FROM groups WHERE id = $1', [groupId]);
     if (g.rows.length === 0) {
       sendError(req, res, 404, 'GROUP_NOT_FOUND', `群 ${groupId} 不存在`);
       return;
     }
-    const gatewayGroupId = g.rows[0].gateway_group_id;
     const acc = await pool.query<{ status: string }>('SELECT status FROM accounts WHERE id = $1', [accountRaw]);
     if (acc.rows.length === 0) {
       sendError(req, res, 409, 'ACCOUNT_NOT_IN_GROUP', `账号 ${accountRaw} 不在群 ${groupId} 中`);
@@ -863,25 +602,9 @@ groupsRouter.post(
       sendError(req, res, 409, 'ACCOUNT_NOT_IN_GROUP', `账号 ${accountRaw} 不在群 ${groupId} 中`);
       return;
     }
-    try {
-      const createOutbound = loadCreateOutbound();
-      const result = createOutbound
-        ? await createOutbound(groupId, accountRaw, textRaw, { detach: true })
-        : await localCreateOutbound(groupId, gatewayGroupId, accountRaw, textRaw);
-      res.status(202).json({ clientMsgId: result.clientMsgId });
-    } catch (e) {
-      // 出站流水线的前置校验失败（如竞态下账号已离群）才到这里；网关同步错误已在行内记 failed。
-      const code = thrownCode(e);
-      if (code === 'ACCOUNT_NOT_IN_GROUP') {
-        sendError(req, res, 409, 'ACCOUNT_NOT_IN_GROUP', `账号 ${accountRaw} 不在群 ${groupId} 中`);
-        return;
-      }
-      if (code === 'ACCOUNT_UNAVAILABLE') {
-        sendError(req, res, 409, 'ACCOUNT_UNAVAILABLE', `账号 ${accountRaw} 当前不可用`);
-        return;
-      }
-      throw e;
-    }
+    // 落行后立即返回；网关调用与落地确认在后台进行，网关同步错误记在出站行上。
+    const result = await createOutbound(groupId, accountRaw, textRaw, { detach: true });
+    res.status(202).json({ clientMsgId: result.clientMsgId });
   }),
 );
 

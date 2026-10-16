@@ -1,11 +1,11 @@
 // Agent 接入（A5 全条 + S5/S6）：触发建 run、主循环、工具执行、审计、恢复 + 查询路由。
-// 出站发送优先走 send.ts 的 createOutbound（动态 require，缺失时用 sequence.deliverMessage 兜底）。
+// 出站发送走 send.ts 的 createOutbound（与操作员发送、序列共用一条出站流水线）。
 import { Request, Response, Router } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import { requireAuth } from './auth';
 import { getPool } from './db';
 import { GatewayError, gwKick, gwMembers } from './gateway';
-import { applyTerminal, deliverMessage, markGroupUnreachable, pollLanding } from './sequence';
+import { applyTerminal, createOutbound, markGroupUnreachable, pollLanding } from './send';
 import { asyncHandler, sendError } from './util';
 import { emit } from './ws';
 
@@ -116,33 +116,6 @@ function isoOf(v: Date | string): string {
   return v instanceof Date ? v.toISOString() : String(v);
 }
 
-// ---------- 可选的 send.ts（动态加载，缺失走 sequence 兜底） ----------
-
-type CreateOutboundFn = (
-  groupId: string,
-  accountId: string,
-  text: string,
-  opts?: { idempotencyKey?: string },
-) => Promise<{ clientMsgId: string; deliveryStatus: string }>;
-
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-function loadSendModule(): unknown {
-  return require('./send.js');
-}
-
-function loadCreateOutbound(): CreateOutboundFn | null {
-  let mod: unknown;
-  try {
-    mod = loadSendModule();
-  } catch {
-    return null;
-  }
-  if (typeof mod !== 'object' || mod === null || !('createOutbound' in mod)) return null;
-  const holder = mod as { createOutbound?: unknown };
-  if (typeof holder.createOutbound !== 'function') return null;
-  return holder.createOutbound as CreateOutboundFn;
-}
-
 // ---------- DB 存取 ----------
 
 async function loadRun(runId: string): Promise<AgentRunState | null> {
@@ -223,7 +196,7 @@ async function emitAgentRun(runId: string, groupId: string, status: string, endR
 
 // ---------- 触发 ----------
 
-// sse.ts 入库后动态 require 此函数：
+// sse.ts 入库后调用此函数：
 // onInboundMessage(groupId, { msgId, senderPlatformUserId, text, sentAt })。
 // groupId 兼容内部 UUID 与网关 groupId 两种传参。
 export function onInboundMessage(
@@ -624,14 +597,14 @@ async function mapOutboundStatus(
   const verdict: AuditVerdict = audited ? 'pass' : null;
   const remain = Math.max(0, CONFIRM_SUPPLEMENT_MS - elapsedMs);
   let row = await readOutboundByClientMsgId(clientMsgId);
-  if ((!row || row.deliveryStatus === 'accepted' || row.deliveryStatus === 'unknown') && remain > 0) {
+  if ((!row || ['sending', 'accepted', 'unknown'].includes(row.deliveryStatus)) && remain > 0) {
     try {
       const landed = await pollLanding(gatewayGroupId, clientMsgId, Math.min(remain, CONFIRM_SUPPLEMENT_MS));
       if (landed) {
         await getPool()
           .query(
             `UPDATE outbound_messages SET delivery_status = 'sent', gateway_msg_id = $2, gateway_sent_at = $3
-             WHERE client_msg_id = $1 AND delivery_status IN ('queued', 'accepted', 'unknown')`,
+             WHERE client_msg_id = $1 AND delivery_status IN ('queued', 'sending', 'accepted', 'unknown')`,
             [clientMsgId, landed.msgId, landed.sentAt],
           )
           .catch(() => undefined);
@@ -729,57 +702,10 @@ async function execSend(
   const accountId = await pickSendAccount(groupId);
   if (!accountId) return errResult('NO_AVAILABLE_ACCOUNT', '群内没有 online 的服务账号可用', 'pass');
   // run 内派生的 clientMsgId 作出站幂等键；确认预算 5 秒。
-  const createOutbound = loadCreateOutbound();
   try {
-    if (createOutbound) {
-      const result = await createOutbound(groupId, accountId, text, { idempotencyKey: cmid });
-      const clientMsgId = typeof result?.clientMsgId === 'string' && result.clientMsgId ? result.clientMsgId : cmid;
-      usedKeys[key] = clientMsgId;
-      return mapOutboundStatus(groupId, gatewayGroupId, clientMsgId, Date.now() - started, true);
-    }
-    // send.ts 未落地兜底：先落 queued 行（网关发出而库里无记录不可能），再走确认流水线。
-    try {
-      await getPool().query(
-        `INSERT INTO outbound_messages(id, group_id, account_id, client_msg_id, text, delivery_status)
-         VALUES ($1, $2, $3, $4, $5, 'queued')`,
-        [uuidv4(), groupId, accountId, cmid, text],
-      );
-    } catch (e) {
-      if (!isUniqueViolation(e)) throw e;
-      // 该 key 已有出站行（崩溃前已落库）：直接按当前状态返回，不重发。
-      usedKeys[key] = cmid;
-      return mapOutboundStatus(groupId, gatewayGroupId, cmid, Date.now() - started, true);
-    }
-    const outcome = await deliverMessage({
-      groupId,
-      gatewayGroupId,
-      accountId,
-      text,
-      clientMsgId: cmid,
-      confirmMs: 5000,
-    });
-    usedKeys[key] = cmid;
-    switch (outcome.kind) {
-      case 'sent':
-        return {
-          ok: true,
-          content: { clientMsgId: cmid, deliveryStatus: 'sent' },
-          summary: `send_message ok: clientMsgId=${cmid} deliveryStatus=sent`,
-          auditVerdict: 'pass',
-        };
-      case 'group_forbidden':
-        return errResult('GROUP_UNREACHABLE', '群不可写（GROUP_WRITE_FORBIDDEN）', 'pass');
-      case 'terminal':
-        return errResult('SEND_FAILED', '发送账号中途进入终态', 'pass');
-      case 'failed':
-        return errResult('SEND_FAILED', `消息发送失败（${outcome.code ?? 'UNKNOWN'}）`, 'pass');
-      case 'rate_limited':
-        return errResult('SEND_FAILED', '账号限流中，消息仍在排队', 'pass');
-      case 'timeout':
-        return errResult('SEND_TIMEOUT', '5 秒内无法确认是否发出（SEND_TIMEOUT）', 'pass');
-      default:
-        return errResult('SEND_FAILED', `消息发送失败（${outcome.code ?? 'OUTBOUND_ERROR'}）`, 'pass');
-    }
+    const result = await createOutbound(groupId, accountId, text, { idempotencyKey: cmid });
+    usedKeys[key] = result.clientMsgId;
+    return mapOutboundStatus(groupId, gatewayGroupId, result.clientMsgId, Date.now() - started, true);
   } catch (e) {
     // createOutbound 抛错：终态/不可写按码映射；疑似 clientMsgId 冲突则读已存在行判定。
     const code = e instanceof GatewayError ? e.code : undefined;

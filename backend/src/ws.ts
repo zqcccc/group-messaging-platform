@@ -3,6 +3,7 @@
 import { Server as HttpServer } from 'http';
 import { Pool } from 'pg';
 import { WebSocket, WebSocketServer } from 'ws';
+import { verifyAccessToken } from './auth';
 import { getPool } from './db';
 
 // 前端事件类型（CONTRACT B4 至少包含这六类）。
@@ -149,14 +150,9 @@ async function verifyAndAdmit(
   frame: AuthFrame,
   authTimer: NodeJS.Timeout,
 ): Promise<boolean> {
-  // 动态 require 避免循环依赖与构建顺序耦合。
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const auth = require('./auth.js') as {
-    verifyAccessToken?: (token: string) => Promise<{ username: string; role: string } | null>;
-  };
   let user: { username: string; role: string } | null = null;
   try {
-    if (typeof auth.verifyAccessToken === 'function') user = await auth.verifyAccessToken(frame.accessToken as string);
+    user = await verifyAccessToken(frame.accessToken as string);
   } catch {
     user = null;
   }

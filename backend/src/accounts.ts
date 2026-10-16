@@ -1,8 +1,9 @@
 // 账号面：列表查询、网关 connect、操作员手动转移（含 A1 转移表、CAS、终态副作用、网关联动）。
 import { Request, Response, Router } from 'express';
-import { Pool } from 'pg';
+import { Pool, PoolClient } from 'pg';
 import { requireAdmin, requireAuth } from './auth';
 import { getPool } from './db';
+import { GatewayError, gwConnect, gwDisconnect } from './gateway';
 import { asyncHandler, sendError } from './util';
 
 // A1 状态转移表（CONTRACT 唯一事实源，代码内常量；终态 suspended/session_expired 无出边）。
@@ -19,10 +20,18 @@ export const TERMINAL_STATUSES: Record<string, true> = { suspended: true, sessio
 
 export type TransitionError = 'ACCOUNT_NOT_FOUND' | 'ILLEGAL_TRANSITION' | 'CAS_CONFLICT';
 
-// 通用状态变更（含终态副作用），后续 send/sse 模块可直接复用：
+// 终态提交后的通知：sequence 模块据此为步骤被跳过的运行排下一步（定时器只在进程内）。
+type TerminalListener = (skippedSequenceRunIds: string[]) => void;
+const terminalListeners: TerminalListener[] = [];
+
+export function onAccountTerminal(listener: TerminalListener): void {
+  terminalListeners.push(listener);
+}
+
+// 通用状态变更（含终态副作用），send/sse/操作员接口共用：
 // 合法性按转移表校验（表外含自转一律 ILLEGAL）；并发用一条带状态条件的 UPDATE 做 CAS；
-// 进入终态时清群成员、取消排队发送、记 ws_events，三者与状态变更同事务，要么都生效要么都不生效。
-// 说明：序列步骤的 skipped 由 sequence 模块按账号终态自行推导（步骤 JSON 结构归它所有）。
+// 进入终态时清群成员、取消排队发送、对应序列步骤置 skipped、记 ws_events，
+// 全部与状态变更同事务，要么都生效要么都不生效。
 export async function applyAccountTransition(
   pool: Pool,
   id: string,
@@ -50,12 +59,18 @@ export async function applyAccountTransition(
       'account_status_changed',
       { accountId: id, from: expectedFrom, to },
     ]);
+    let skippedRuns: string[] = [];
     if (TERMINAL_STATUSES[to]) {
       await client.query('DELETE FROM group_members WHERE account_id = $1', [id]);
-      await client.query(
+      const cancelled = await client.query<{ client_msg_id: string }>(
         `UPDATE outbound_messages SET delivery_status = 'cancelled', fail_code = 'ACCOUNT_TERMINAL'
-         WHERE account_id = $1 AND delivery_status IN ('queued', 'accepted', 'unknown')`,
+         WHERE account_id = $1 AND delivery_status IN ('queued', 'sending', 'accepted', 'unknown')
+         RETURNING client_msg_id`,
         [id],
+      );
+      skippedRuns = await skipSequenceSteps(
+        client,
+        cancelled.rows.map((r) => r.client_msg_id),
       );
       await client.query('INSERT INTO ws_events(type, payload) VALUES ($1, $2)', [
         'account_terminal',
@@ -63,6 +78,15 @@ export async function applyAccountTransition(
       ]);
     }
     await client.query('COMMIT');
+    if (skippedRuns.length > 0) {
+      for (const listener of terminalListeners) {
+        try {
+          listener(skippedRuns);
+        } catch {
+          // 监听方异常不影响已提交的转移；序列下次触发/重启恢复时照常推进。
+        }
+      }
+    }
     return { ok: true, status: to };
   } catch (e) {
     try {
@@ -76,34 +100,31 @@ export async function applyAccountTransition(
   }
 }
 
-// 网关 POST 最小封装（完整客户端归 src/gateway.ts 所有，这里只为避免文件冲突先内联两个调用）。
-async function gatewayPost(path: string, body: unknown): Promise<{ status: number; data: unknown }> {
-  const base = (process.env.GATEWAY_URL ?? '').replace(/\/+$/, '');
-  if (!base) throw new Error('缺少环境变量 GATEWAY_URL');
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 10000);
-  try {
-    const res = await fetch(base + path, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body ?? {}),
-      signal: ctrl.signal,
-    });
-    const data: unknown = await res.json().catch(() => null);
-    return { status: res.status, data };
-  } finally {
-    clearTimeout(timer);
+// 被取消的出站行对应的序列步骤（运行中、仍 pending）置 skipped，并推 sequence_run 事件；返回受影响的运行 id。
+// 跳过时刻即"发出"时刻（B1），下一步由 onAccountTerminal 监听方按它排期。
+async function skipSequenceSteps(client: PoolClient, clientMsgIds: string[]): Promise<string[]> {
+  if (clientMsgIds.length === 0) return [];
+  const runs = await client.query<{ id: string; group_id: string; current_step_index: number }>(
+    `UPDATE sequence_runs r SET steps = (
+       SELECT jsonb_agg(
+         CASE WHEN s->>'status' = 'pending' AND s->>'clientMsgId' = ANY($1)
+              THEN s || jsonb_build_object('status', 'skipped', 'sentAt', $2::text, 'failCode', 'ACCOUNT_TERMINAL')
+              ELSE s END
+         ORDER BY ord)
+       FROM jsonb_array_elements(r.steps) WITH ORDINALITY AS t(s, ord))
+     WHERE r.status = 'running' AND EXISTS (
+       SELECT 1 FROM jsonb_array_elements(r.steps) s
+       WHERE s->>'status' = 'pending' AND s->>'clientMsgId' = ANY($1))
+     RETURNING r.id, r.group_id, r.current_step_index`,
+    [clientMsgIds, new Date().toISOString()],
+  );
+  for (const run of runs.rows) {
+    await client.query('INSERT INTO ws_events(type, payload) VALUES ($1, $2)', [
+      'sequence_run',
+      { runId: run.id, groupId: run.group_id, status: 'running', currentStepIndex: run.current_step_index },
+    ]);
   }
-}
-
-// 网关错误码：兼容 { code } 与 { error: { code } } 两种形状。
-function gatewayCode(data: unknown): string | undefined {
-  if (typeof data !== 'object' || data === null) return undefined;
-  const d = data as Record<string, unknown>;
-  if (typeof d.code === 'string') return d.code;
-  const inner = d.error as Record<string, unknown> | undefined;
-  if (inner && typeof inner.code === 'string') return inner.code;
-  return undefined;
+  return runs.rows.map((r) => r.id);
 }
 
 export const accountsRouter: Router = Router();
@@ -147,31 +168,22 @@ accountsRouter.post(
       sendError(req, res, 409, 'ILLEGAL_TRANSITION', `状态 ${status} 不允许 connect`);
       return;
     }
-    let gw: { status: number; data: unknown };
+    let platformUserId: string;
     try {
-      gw = await gatewayPost(`/accounts/${encodeURIComponent(id)}/connect`, {});
-    } catch {
-      sendError(req, res, 502, 'GATEWAY_UNAVAILABLE', '网关不可用');
-      return;
-    }
-    const code = gatewayCode(gw.data);
-    if (code === 'SESSION_EXPIRED' || (code === undefined && gw.status === 401)) {
-      await applyAccountTransition(getPool(), id, 'session_expired', status);
-      sendError(req, res, 401, 'SESSION_EXPIRED', '账号会话已失效');
-      return;
-    }
-    if (code === 'ACCOUNT_SUSPENDED' || (code === undefined && gw.status === 403)) {
-      await applyAccountTransition(getPool(), id, 'suspended', status);
-      sendError(req, res, 403, 'ACCOUNT_SUSPENDED', '账号已被停用');
-      return;
-    }
-    if (gw.status < 200 || gw.status >= 300) {
-      sendError(req, res, 502, 'GATEWAY_UNAVAILABLE', `网关返回 ${gw.status}`);
-      return;
-    }
-    const platformUserId = (gw.data as { platformUserId?: unknown } | null)?.platformUserId;
-    if (typeof platformUserId !== 'string' || !platformUserId) {
-      sendError(req, res, 502, 'GATEWAY_UNAVAILABLE', '网关响应缺少 platformUserId');
+      ({ platformUserId } = await gwConnect(id));
+    } catch (e) {
+      const code = e instanceof GatewayError ? e.code : undefined;
+      if (code === 'SESSION_EXPIRED' || code === 'HTTP_401') {
+        await applyAccountTransition(getPool(), id, 'session_expired', status);
+        sendError(req, res, 401, 'SESSION_EXPIRED', '账号会话已失效');
+        return;
+      }
+      if (code === 'ACCOUNT_SUSPENDED' || code === 'HTTP_403') {
+        await applyAccountTransition(getPool(), id, 'suspended', status);
+        sendError(req, res, 403, 'ACCOUNT_SUSPENDED', '账号已被停用');
+        return;
+      }
+      sendError(req, res, 502, 'GATEWAY_UNAVAILABLE', e instanceof Error ? e.message : '网关不可用');
       return;
     }
     // CAS：只在状态仍是 connect 前读到的值时生效，并与 account_status_changed 事件同事务落库。
@@ -236,16 +248,16 @@ accountsRouter.post(
     let status = r.status;
     if (status === 'idle' || status === 'disconnected') {
       try {
-        const gw = await gatewayPost(`/accounts/${encodeURIComponent(id)}/disconnect`, {});
-        const code = gatewayCode(gw.data);
+        await gwDisconnect(id);
+      } catch (e) {
+        // 网关失败时仍以本地标记为准，不回滚；唯独明确报终态时升级为终态。
+        const code = e instanceof GatewayError ? e.code : undefined;
         const terminal =
           code === 'SESSION_EXPIRED' ? 'session_expired' : code === 'ACCOUNT_SUSPENDED' ? 'suspended' : null;
         if (terminal) {
           const t2 = await applyAccountTransition(getPool(), id, terminal, status);
           if (t2.ok) status = t2.status;
         }
-      } catch {
-        // 网关不可达时仍以本地标记为准，不回滚。
       }
     }
     res.json({ status });
