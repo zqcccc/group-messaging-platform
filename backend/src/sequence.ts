@@ -7,6 +7,16 @@ import { requireAdmin, requireAuth } from './auth';
 import { getPool } from './db';
 import { GatewayError, gwByClientId, gwSend } from './gateway';
 import { asyncHandler, sendError } from './util';
+// 状态与事件常量（字面量统一收口，避免散落）。
+const ACCOUNT_ONLINE = 'online';
+const ACCOUNT_RATE_LIMITED = 'rate_limited';
+const ACCOUNT_SUSPENDED = 'suspended';
+const ACCOUNT_SESSION_EXPIRED = 'session_expired';
+const GROUP_UNREACHABLE = 'unreachable';
+const EVT_ACCOUNT_STATUS = 'account_status_changed';
+const EVT_GROUP_UPDATED = 'group_updated';
+const EVT_MESSAGE = 'message';
+const EVT_SEQUENCE_RUN = 'sequence_run';
 
 // ---------- 小工具 ----------
 
@@ -25,6 +35,11 @@ async function emitWs(type: string, payload: Record<string, unknown>): Promise<v
   } catch {
     // 事件落库失败不影响主流程。
   }
+}
+
+// 自发消息及其投递状态变化即时推前端（时间线按 clientMsgId 合行）。
+async function emitOwnMessage(groupId: string, clientMsgId: string): Promise<void> {
+  await emitWs(EVT_MESSAGE, { groupId, msgId: clientMsgId, isOwn: true });
 }
 
 function routeParam(req: Request, name: string): string | null {
@@ -91,14 +106,17 @@ export async function applyRateLimited(accountId: string, retryAfterSeconds: num
   const cur = await pool.query('SELECT status FROM accounts WHERE id = $1', [accountId]);
   if (cur.rows.length === 0) return;
   const from = String(cur.rows[0].status);
-  if (from === 'suspended' || from === 'session_expired') return;
+  if (from === ACCOUNT_SUSPENDED || from === ACCOUNT_SESSION_EXPIRED) return;
   const secs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0 ? Math.ceil(retryAfterSeconds) : 60;
-  await pool.query(
+  const upd = await pool.query(
     `UPDATE accounts SET status = 'rate_limited', rate_limited_until = now() + ($2 || ' seconds')::interval
-     WHERE id = $1 AND status NOT IN ('suspended', 'session_expired')`,
+     WHERE id = $1 AND status NOT IN ('suspended', 'session_expired') RETURNING rate_limited_until`,
     [accountId, String(secs)],
   );
-  await emitWs('account_status_changed', { accountId, from, to: 'rate_limited' });
+  const untilRaw = upd.rows[0]?.rate_limited_until as Date | string | null | undefined;
+  const rateLimitedUntil =
+    untilRaw instanceof Date ? untilRaw.toISOString() : untilRaw != null ? String(untilRaw) : null;
+  await emitWs(EVT_ACCOUNT_STATUS, { accountId, from, to: ACCOUNT_RATE_LIMITED, rateLimitedUntil });
   // 到期恢复：只在仍是 rate_limited 且窗口已过时转回 online。
   setTimeout(() => {
     void (async () => {
@@ -109,7 +127,12 @@ export async function applyRateLimited(accountId: string, retryAfterSeconds: num
           [accountId],
         );
         if ((r.rowCount ?? 0) > 0) {
-          await emitWs('account_status_changed', { accountId, from: 'rate_limited', to: 'online' });
+          await emitWs(EVT_ACCOUNT_STATUS, {
+            accountId,
+            from: ACCOUNT_RATE_LIMITED,
+            to: ACCOUNT_ONLINE,
+            rateLimitedUntil: null,
+          });
           // 到期后按原顺序发出该账号排队中的消息（动态加载 send 模块，避免循环依赖）。
           try {
             // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -135,13 +158,16 @@ export async function applyTerminal(accountId: string, to: 'suspended' | 'sessio
   const cur = await pool.query('SELECT status FROM accounts WHERE id = $1', [accountId]);
   if (cur.rows.length === 0) return;
   const from = String(cur.rows[0].status);
-  if (from === to || from === 'suspended' || from === 'session_expired') return;
+  if (from === to || from === ACCOUNT_SUSPENDED || from === ACCOUNT_SESSION_EXPIRED) return;
   await applyAccountTransition(pool, accountId, to, from);
 }
 
 // 群不可写：群置 unreachable（账号状态不变）。
 export async function markGroupUnreachable(groupId: string): Promise<void> {
-  await getPool().query(`UPDATE groups SET status = 'unreachable' WHERE id = $1 AND status = 'active'`, [groupId]);
+  const r = await getPool().query(`UPDATE groups SET status = 'unreachable' WHERE id = $1 AND status = 'active'`, [groupId]);
+  if ((r.rowCount ?? 0) > 0) {
+    await emitWs(EVT_GROUP_UPDATED, { groupId, status: GROUP_UNREACHABLE });
+  }
 }
 
 // ---------- 出站发送（含确认与重发仲裁，供序列与 agent 共用） ----------
@@ -236,11 +262,14 @@ export async function deliverMessage(args: {
       [uuidv4(), args.groupId, args.accountId, clientMsgId, args.text],
     );
   }
+  // 入队即推（新插入与调用方预插入都覆盖），前端即时见到自己发出的消息。
+  await emitWs(EVT_MESSAGE, { groupId: args.groupId, msgId: clientMsgId, isOwn: true });
   const accepted = async (): Promise<void> => {
     await pool.query(
       `UPDATE outbound_messages SET delivery_status = 'accepted', accepted_at = now() WHERE client_msg_id = $1`,
       [clientMsgId],
     );
+    await emitOwnMessage(args.groupId, clientMsgId);
   };
   try {
     await gwSend(args.gatewayGroupId, args.accountId, clientMsgId, args.text);
@@ -257,10 +286,12 @@ export async function deliverMessage(args: {
       await pool.query(`UPDATE outbound_messages SET delivery_status = 'unknown' WHERE client_msg_id = $1`, [
         clientMsgId,
       ]);
+      await emitOwnMessage(args.groupId, clientMsgId);
       // 2 秒窗口确认（网关保证 504 后 2 秒内收敛）。
       const landed = await pollLanding(args.gatewayGroupId, clientMsgId, 2500);
       if (landed) {
         await markRowSent(clientMsgId, landed.msgId, landed.sentAt);
+        await emitOwnMessage(args.groupId, clientMsgId);
         return { kind: 'sent', clientMsgId, msgId: landed.msgId, sentAt: landed.sentAt };
       }
       // 确认未发出且可重发：同 clientMsgId 重发一次。
@@ -268,6 +299,7 @@ export async function deliverMessage(args: {
         return await deliverResend(args.groupId, args.gatewayGroupId, args.accountId, args.text, clientMsgId, confirmMs);
       }
       await markRowFailed(clientMsgId, 'NETWORK_TIMEOUT');
+      await emitOwnMessage(args.groupId, clientMsgId);
       return { kind: 'failed', clientMsgId, code: 'NETWORK_TIMEOUT' };
     }
     if (code === 'ACCOUNT_SUSPENDED' || code === 'SESSION_EXPIRED') {
@@ -278,15 +310,18 @@ export async function deliverMessage(args: {
          WHERE client_msg_id = $1`,
         [clientMsgId],
       );
+      await emitOwnMessage(args.groupId, clientMsgId);
       return { kind: 'terminal', clientMsgId, terminal };
     }
     if (code === 'GROUP_WRITE_FORBIDDEN') {
       await markRowFailed(clientMsgId, code);
+      await emitOwnMessage(args.groupId, clientMsgId);
       await markGroupUnreachable(args.groupId);
       return { kind: 'group_forbidden', clientMsgId, code };
     }
     if (code === 'SENDER_NOT_IN_GROUP' || code === 'ACCOUNT_OFFLINE') {
       await markRowFailed(clientMsgId, code);
+      await emitOwnMessage(args.groupId, clientMsgId);
       return { kind: 'failed', clientMsgId, code };
     }
     // 503 RETRYABLE / 不可达等：行保持 queued，调用方稍后重试。
@@ -296,6 +331,7 @@ export async function deliverMessage(args: {
   const landed = await pollLanding(args.gatewayGroupId, clientMsgId, confirmMs);
   if (landed) {
     await markRowSent(clientMsgId, landed.msgId, landed.sentAt);
+    await emitOwnMessage(args.groupId, clientMsgId);
     return { kind: 'sent', clientMsgId, msgId: landed.msgId, sentAt: landed.sentAt };
   }
   return { kind: 'timeout', clientMsgId };
@@ -317,6 +353,7 @@ async function deliverResend(
       `UPDATE outbound_messages SET delivery_status = 'accepted', accepted_at = now() WHERE client_msg_id = $1`,
       [clientMsgId],
     );
+    await emitOwnMessage(groupId, clientMsgId);
   } catch (e) {
     const code = e instanceof GatewayError ? e.code : 'GATEWAY_UNREACHABLE';
     if (code === 'RATE_LIMITED') {
@@ -332,19 +369,23 @@ async function deliverResend(
          WHERE client_msg_id = $1`,
         [clientMsgId],
       );
+      await emitOwnMessage(groupId, clientMsgId);
       return { kind: 'terminal', clientMsgId, terminal };
     }
     if (code === 'GROUP_WRITE_FORBIDDEN') {
       await markRowFailed(clientMsgId, code);
+      await emitOwnMessage(groupId, clientMsgId);
       await markGroupUnreachable(groupId);
       return { kind: 'group_forbidden', clientMsgId, code };
     }
     if (code === 'SENDER_NOT_IN_GROUP' || code === 'ACCOUNT_OFFLINE') {
       await markRowFailed(clientMsgId, code);
+      await emitOwnMessage(groupId, clientMsgId);
       return { kind: 'failed', clientMsgId, code };
     }
     if (code === 'NETWORK_TIMEOUT') {
       await markRowFailed(clientMsgId, 'NETWORK_TIMEOUT');
+      await emitOwnMessage(groupId, clientMsgId);
       return { kind: 'failed', clientMsgId, code: 'NETWORK_TIMEOUT' };
     }
     return { kind: 'retry_later', clientMsgId, code };
@@ -352,6 +393,7 @@ async function deliverResend(
   const landed = await pollLanding(gatewayGroupId, clientMsgId, confirmMs);
   if (landed) {
     await markRowSent(clientMsgId, landed.msgId, landed.sentAt);
+    await emitOwnMessage(groupId, clientMsgId);
     return { kind: 'sent', clientMsgId, msgId: landed.msgId, sentAt: landed.sentAt };
   }
   return { kind: 'timeout', clientMsgId };
@@ -451,7 +493,7 @@ async function saveSeqRun(runId: string, steps: SeqStepState[], extra?: { status
 }
 
 async function emitSeqRun(runId: string, groupId: string, status: string, currentStepIndex: number): Promise<void> {
-  await emitWs('sequence_run', { runId, groupId, status, currentStepIndex });
+  await emitWs(EVT_SEQUENCE_RUN, { runId, groupId, status, currentStepIndex });
 }
 
 // ---------- 账号选择 ----------
@@ -797,6 +839,32 @@ sequenceRouter.post(
       JSON.stringify(defs),
     ]);
     res.json({ id });
+  }),
+);
+// GET /api/sequences → [{ id, name, steps }]。
+sequenceRouter.get(
+  '/sequences',
+  requireAuth,
+  asyncHandler(async (_req: Request, res: Response) => {
+    const r = await getPool().query<{ id: string; name: string; steps: unknown }>(
+      'SELECT id, name, steps FROM sequences ORDER BY id',
+    );
+    res.json(
+      r.rows.map((row) => {
+        let steps: SeqStepDef[] = [];
+        if (Array.isArray(row.steps)) {
+          steps = row.steps as SeqStepDef[];
+        } else if (typeof row.steps === 'string') {
+          try {
+            const parsed: unknown = JSON.parse(row.steps);
+            if (Array.isArray(parsed)) steps = parsed as SeqStepDef[];
+          } catch {
+            steps = [];
+          }
+        }
+        return { id: row.id, name: row.name, steps };
+      }),
+    );
   }),
 );
 

@@ -1,11 +1,30 @@
 import { useCallback, useEffect, useState } from 'react';
-import { ApiError, fetchJson, postJson, type Sequence, type SequenceRun } from '../api';
+import { useSearchParams } from 'react-router-dom';
+import { ApiError, fetchJson, postJson, type Group, type Sequence, type SequenceRun } from '../api';
 import { useAuth } from '../auth';
 import { useWs } from '../ws';
 import { ReadOnlyNote } from '../components/ui';
 
-// 占位符 key 规则：{key}，key 匹配 [A-Za-z0-9_]+
+// 顶部常量：枚举、状态、来源、事件、键、参数名统一在此定义
 const PLACEHOLDER_RE = /\{([A-Za-z0-9_]+)\}/g;
+const VAR_SOURCE_DEFAULT = 'default';
+const VAR_SOURCE_STEP_PREFIX = 'step:';
+const STEP_STATUS_PENDING = 'pending';
+const STEP_STATUS_SENT = 'sent';
+const STEP_STATUS_FAILED = 'failed';
+const STEP_STATUS_CANCELLED = 'cancelled';
+const STEP_STATUS_ACCEPTED = 'accepted';
+const ERR_UNRESOLVED_PLACEHOLDER = 'UNRESOLVED_PLACEHOLDER';
+const WS_EVENT_SEQUENCE_RUN = 'sequence_run';
+const KEY_ESCAPE = 'Escape';
+const EVENT_KEYDOWN = 'keydown';
+const ROLE_DIALOG = 'dialog' as const;
+const PARAM_RUN_ID = 'runId';
+const PARAM_GROUP_ID = 'groupId';
+const BADGE_GREEN = 'green';
+const BADGE_RED = 'red';
+const HTTP_NOT_FOUND = 404;
+const HTTP_METHOD_NOT_ALLOWED = 405;
 
 function keysOf(text: string): string[] {
   const out: string[] = [];
@@ -24,10 +43,7 @@ interface PreviewRow {
   resolved: Array<{ key: string; value: string; source: string }>;
 }
 
-// 本地逐 key 解析预检：复刻 B1 取值规则
-// - vars 里 "" 视为未提供；stepVars 里 "" 表示这一步不改
-// - 某步给了值则从该步起后续沿用，直到更晚的步骤再给值
-// - varSources 标最初给出该值的来源（default 或 step:N）
+// 本地逐 key 解析预检：复刻后端取值规则
 function previewSequence(
   steps: Array<{ index: number; accountRole: string; text: string }>,
   vars: Record<string, string>,
@@ -38,7 +54,7 @@ function previewSequence(
   Object.entries(vars).forEach(([k, v]) => {
     if (v !== '') {
       cur[k] = v;
-      src[k] = 'default';
+      src[k] = VAR_SOURCE_DEFAULT;
     }
   });
   const rows: PreviewRow[] = [];
@@ -48,7 +64,7 @@ function previewSequence(
     Object.entries(overrides).forEach(([k, v]) => {
       if (v !== '') {
         cur[k] = v;
-        src[k] = `step:${s.index}`;
+        src[k] = VAR_SOURCE_STEP_PREFIX + String(s.index);
       }
     });
     const resolved: PreviewRow['resolved'] = [];
@@ -63,7 +79,7 @@ function previewSequence(
   return { rows, error: null };
 }
 
-// 文本域解析：支持 JSON 或 "key=value" 每行一个；解析失败抛错提示
+// 文本域解析：支持 JSON 或 key=value 每行一个
 function parseVarsInput(text: string): Record<string, string> {
   const t = text.trim();
   if (!t) return {};
@@ -84,39 +100,66 @@ function parseVarsInput(text: string): Record<string, string> {
   return out;
 }
 
-// 序列运行页：序列选择 + vars/stepVars 表单 → 本地预检弹窗 → POST 启动；
-// 422 显示 stepIndex + key；运行中进度条 + 每步状态/时间戳
+// 运行步骤状态徽标颜色
+function statusBadgeClass(status: string): string {
+  if (status === STEP_STATUS_SENT || status === STEP_STATUS_ACCEPTED) return BADGE_GREEN;
+  if (status === STEP_STATUS_FAILED || status === STEP_STATUS_CANCELLED) return BADGE_RED;
+  return '';
+}
+
+// 序列运行页：选择群组与序列，本地预检后启动，轮询展示进度
 export default function SequencesPage() {
   const { isViewer } = useAuth();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [sequences, setSequences] = useState<Sequence[]>([]);
+  const [groups, setGroups] = useState<Group[]>([]);
   const [seqId, setSeqId] = useState('');
-  const [groupId, setGroupId] = useState('');
+  const [groupId, setGroupId] = useState(() => searchParams.get(PARAM_GROUP_ID) ?? '');
   const [varsText, setVarsText] = useState('event=发布会\ntime=今晚八点\nlocation=共享盘/第二季度');
   const [stepVarsText, setStepVarsText] = useState('{\n  "2": { "location": "共享盘/第二季度" }\n}');
   const [err, setErr] = useState('');
   const [preview, setPreview] = useState<PreviewRow[] | null>(null);
   const [previewErr, setPreviewErr] = useState('');
   const [showPreview, setShowPreview] = useState(false);
-  const [runId, setRunId] = useState('');
+  const [runId, setRunId] = useState(() => searchParams.get(PARAM_RUN_ID) ?? '');
   const [run, setRun] = useState<SequenceRun | null>(null);
   const [startMsg, setStartMsg] = useState('');
+  const [creatingSeq, setCreatingSeq] = useState(false);
+  const [starting, setStarting] = useState(false);
+  const [manualSeqId, setManualSeqId] = useState('');
+  const effectiveSeqId = seqId || manualSeqId.trim();
+  const [newSeqName, setNewSeqName] = useState('新序列');
+  const [newSeqSteps, setNewSeqSteps] = useState('[\n  { "index": 1, "accountRole": "admin", "text": "{event} 将于 {time} 开始", "delaySeconds": 10 },\n  { "index": 2, "accountRole": "member", "text": "资料已上传到 {location}", "delaySeconds": 5 }\n]');
+  const [createMsg, setCreateMsg] = useState('');
 
-  // 后端无 GET /api/sequences 列表接口：404/405 时列表留空，允许手动填 sequenceId
+  // 同步运行进度到地址栏，刷新不丢失且支持深链直达
+  const syncUrl = useCallback((rid: string, gid: string) => {
+    const next: Record<string, string> = {};
+    if (rid) next[PARAM_RUN_ID] = rid;
+    const g = gid.trim();
+    if (g) next[PARAM_GROUP_ID] = g;
+    setSearchParams(next, { replace: true });
+  }, [setSearchParams]);
+
   const load = useCallback(async () => {
     try {
       const data = await fetchJson<Sequence[]>('/api/sequences');
       setSequences(data);
       setErr('');
-      if (!seqId && data.length > 0) setSeqId(data[0].id);
+      if (data.length > 0) setSeqId((prev) => prev || data[0].id);
     } catch (e) {
-      if (e instanceof ApiError && (e.status === 404 || e.status === 405)) {
-        // 后端无列表接口：列表留空、手动填 sequenceId 或下方新建序列
+      if (e instanceof ApiError && (e.status === HTTP_NOT_FOUND || e.status === HTTP_METHOD_NOT_ALLOWED)) {
         setSequences([]);
       } else {
         setErr(e instanceof ApiError ? `${e.message}（${e.code}）` : '加载失败');
       }
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    try {
+      const g = await fetchJson<Group[]>('/api/groups');
+      setGroups(g);
+    } catch {
+      setGroups([]);
+    }
   }, []);
 
   useEffect(() => {
@@ -128,11 +171,11 @@ export default function SequencesPage() {
       const r = await fetchJson<SequenceRun>(`/api/sequence-runs/${id}`);
       setRun(r);
     } catch {
-      // 轮询间隙失败：保留上一次状态
+      // 轮询间隙失败时保留上一次状态
     }
   }, []);
 
-  // 运行中轮询（3s）+ WS sequence_run 事件刷新
+  // 运行中轮询（3s）+ WS 事件刷新
   useEffect(() => {
     if (!runId) return;
     loadRun(runId);
@@ -140,21 +183,33 @@ export default function SequencesPage() {
     return () => clearInterval(t);
   }, [runId, loadRun]);
 
-  useWs(['sequence_run'], (f) => {
+  useWs([WS_EVENT_SEQUENCE_RUN], (f) => {
     const p = f.payload as { runId?: string };
     if (p.runId && p.runId === runId) loadRun(runId);
   });
 
-  // 手动填 sequenceId（后端无列表接口时用）；新建序列成功后也会回填到这里
-  const [manualSeqId, setManualSeqId] = useState('');
-  // 生效的 sequenceId：下拉选中优先，否则用手动输入框
-  const effectiveSeqId = seqId || manualSeqId.trim();
-  // 新建序列表单：POST /api/sequences { name, steps } → { id }，成功后回填到启动表单
-  const [newSeqName, setNewSeqName] = useState('新序列');
-  const [newSeqSteps, setNewSeqSteps] = useState('[\n  { "index": 1, "accountRole": "admin", "text": "{event} 将于 {time} 开始", "delaySeconds": 10 },\n  { "index": 2, "accountRole": "member", "text": "资料已上传到 {location}", "delaySeconds": 5 }\n]');
-  const [createMsg, setCreateMsg] = useState('');
+  // 预检弹窗打开时支持按键关闭
+  useEffect(() => {
+    if (!showPreview) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === KEY_ESCAPE) setShowPreview(false);
+    };
+    window.addEventListener(EVENT_KEYDOWN, onKey);
+    return () => window.removeEventListener(EVENT_KEYDOWN, onKey);
+  }, [showPreview]);
+
+  // 查看指定运行并同步地址栏
+  const viewRun = useCallback((id: string) => {
+    const v = id.trim();
+    if (!v) return;
+    setRunId(v);
+    setRun(null);
+    syncUrl(v, groupId);
+    loadRun(v);
+  }, [groupId, syncUrl, loadRun]);
 
   const createSequence = async () => {
+    if (creatingSeq) return;
     setCreateMsg('');
     let steps: unknown;
     try {
@@ -163,17 +218,19 @@ export default function SequencesPage() {
       setCreateMsg('新建失败：steps 不是合法 JSON');
       return;
     }
+    setCreatingSeq(true);
     try {
-      const r = await postJson<{ id: string }>('/api/sequences', { name: newSeqName.trim() || '未命名序列', steps });
+      const name = newSeqName.trim() || '未命名序列';
+      const r = await postJson<{ id: string }>('/api/sequences', { name, steps });
       setCreateMsg(`已创建序列（id ${r.id}），已填入启动表单`);
       setSeqId(r.id);
       setManualSeqId(r.id);
-      setSequences((prev) => {
-        const stepsArr = Array.isArray(steps) ? (steps as Sequence['steps']) : [];
-        return [...prev, { id: r.id, name: newSeqName.trim() || '未命名序列', steps: stepsArr }];
-      });
+      const stepsArr = Array.isArray(steps) ? (steps as Sequence['steps']) : [];
+      setSequences((prev) => [...prev, { id: r.id, name, steps: stepsArr }]);
     } catch (e) {
       setCreateMsg(e instanceof ApiError ? `新建失败：${e.message}（${e.code}）` : '新建失败');
+    } finally {
+      setCreatingSeq(false);
     }
   };
 
@@ -183,10 +240,9 @@ export default function SequencesPage() {
     setPreviewErr('');
     setPreview(null);
     if (!selected && !manualSeqId.trim()) {
-      setPreviewErr('请先选择序列，或手动填写 sequenceId（后端无列表接口）');
+      setPreviewErr('请先选择序列，或手动填写 sequenceId');
       return;
     }
-    // 手动 id 无本地步骤可预检：提示直接启动，由后端 422 返回 stepIndex/key
     if (!selected && manualSeqId.trim()) {
       setPreviewErr('手动填写的 sequenceId 无本地步骤可预检，请直接启动（缺 key 时后端会返回 stepIndex 与 key）');
       return;
@@ -217,8 +273,10 @@ export default function SequencesPage() {
   };
 
   const start = async () => {
+    if (starting) return;
     setStartMsg('');
-    if (!groupId.trim()) {
+    const gid = groupId.trim();
+    if (!gid) {
       setStartMsg('请填写群 ID');
       return;
     }
@@ -236,8 +294,9 @@ export default function SequencesPage() {
       setStartMsg('请先选择序列或填写 sequenceId');
       return;
     }
+    setStarting(true);
     try {
-      const r = await postJson<{ runId: string }>(`/api/groups/${groupId.trim()}/sequence-runs`, {
+      const r = await postJson<{ runId: string }>(`/api/groups/${gid}/sequence-runs`, {
         sequenceId: effectiveSeqId,
         vars,
         stepVars,
@@ -246,18 +305,22 @@ export default function SequencesPage() {
       setRun(null);
       setStartMsg(`已启动（run ${r.runId}）`);
       setShowPreview(false);
+      syncUrl(r.runId, gid);
       loadRun(r.runId);
     } catch (e) {
-      if (e instanceof ApiError && e.code === 'UNRESOLVED_PLACEHOLDER') {
+      if (e instanceof ApiError && e.code === ERR_UNRESOLVED_PLACEHOLDER) {
         setStartMsg(`预检不通过：stepIndex=${e.stepIndex}，key=${e.key}（${e.message}）`);
       } else {
         setStartMsg(e instanceof ApiError ? `启动失败：${e.message}（${e.code}）` : '启动失败');
       }
+    } finally {
+      setStarting(false);
     }
   };
 
-  const done = run ? run.steps.filter((s) => s.status !== 'pending').length : 0;
+  const done = run ? run.steps.filter((s) => s.status !== STEP_STATUS_PENDING).length : 0;
   const total = run ? run.steps.length : 0;
+  const groupSelected = groups.some((g) => g.id === groupId) ? groupId : '';
 
   return (
     <div>
@@ -269,6 +332,15 @@ export default function SequencesPage() {
           <span>群 ID：</span>
           <input value={groupId} onChange={(e) => setGroupId(e.target.value)} placeholder="群 id（uuid）" style={{ flex: 1 }} />
         </div>
+        {groups.length > 0 && (
+          <div className="form-row">
+            <span>选择已有群：</span>
+            <select value={groupSelected} onChange={(e) => setGroupId(e.target.value)} style={{ flex: 1 }}>
+              <option value="">（手动输入群 ID）</option>
+              {groups.map((g) => <option key={g.id} value={g.id}>{g.id.slice(0, 8)}…（{g.status}，{g.members.length} 成员）</option>)}
+            </select>
+          </div>
+        )}
         <div className="form-row">
           <span>序列：</span>
           <select value={seqId} onChange={(e) => { setSeqId(e.target.value); setManualSeqId(''); }} style={{ flex: 1 }}>
@@ -282,7 +354,7 @@ export default function SequencesPage() {
             <input value={manualSeqId} onChange={(e) => { setManualSeqId(e.target.value); setSeqId(''); }} placeholder="粘贴 POST /api/sequences 返回的 id，或下方新建" style={{ flex: 1 }} />
           </div>
         )}
-        {!isViewer && sequences.length === 0 && (
+        {!isViewer && (
           <div className="card" style={{ marginTop: 8 }}>
             <h4>新建序列（POST /api/sequences）</h4>
             <div className="form-row">
@@ -294,7 +366,7 @@ export default function SequencesPage() {
               <textarea value={newSeqSteps} onChange={(e) => setNewSeqSteps(e.target.value)} rows={5} style={{ flex: 1 }} />
             </div>
             <div className="form-row">
-              <button onClick={createSequence}>创建序列</button>
+              <button onClick={createSequence} disabled={creatingSeq}>创建序列</button>
             </div>
             {createMsg && <div className="note">{createMsg}</div>}
           </div>
@@ -306,29 +378,30 @@ export default function SequencesPage() {
             ))}
           </div>
         )}
-        {!isViewer && (
-          <>
-            <div className="form-row" style={{ alignItems: 'flex-start' }}>
-              <span>vars（JSON 或 key=value 每行）：</span>
-              <textarea value={varsText} onChange={(e) => setVarsText(e.target.value)} rows={4} style={{ flex: 1 }} />
-            </div>
-            <div className="form-row" style={{ alignItems: 'flex-start' }}>
-              <span>stepVars（JSON）：</span>
-              <textarea value={stepVarsText} onChange={(e) => setStepVarsText(e.target.value)} rows={4} style={{ flex: 1 }} />
-            </div>
-            <div className="form-row">
-              <button onClick={doPreview}>本地预检</button>
-              <button className="primary" onClick={start}>启动</button>
-            </div>
-          </>
-        )}
+        <div className="form-row" style={{ alignItems: 'flex-start' }}>
+          <span>vars（JSON 或 key=value 每行）：</span>
+          <textarea value={varsText} onChange={(e) => setVarsText(e.target.value)} rows={4} style={{ flex: 1 }} />
+        </div>
+        <div className="form-row" style={{ alignItems: 'flex-start' }}>
+          <span>stepVars（JSON）：</span>
+          <textarea value={stepVarsText} onChange={(e) => setStepVarsText(e.target.value)} rows={4} style={{ flex: 1 }} />
+        </div>
+        <div className="form-row">
+          <button onClick={doPreview}>本地预检</button>
+          {!isViewer && <button className="primary" onClick={start} disabled={starting}>启动</button>}
+        </div>
         {previewErr && <div className="err">{previewErr}</div>}
         {startMsg && <div className="note">{startMsg}</div>}
+        <div className="form-row">
+          <span>运行 ID：</span>
+          <input value={runId} onChange={(e) => setRunId(e.target.value)} placeholder="启动后自动填入，刷新不丢失" style={{ flex: 1 }} />
+          <button onClick={() => viewRun(runId)} disabled={!runId.trim()}>查看</button>
+        </div>
       </div>
 
       {showPreview && preview && (
         <div className="modal-mask" onClick={() => setShowPreview(false)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
+          <div className="modal" onClick={(e) => e.stopPropagation()} role={ROLE_DIALOG} aria-modal="true">
             <h3>预检结果：每步 key 最终取值与来源</h3>
             {preview.map((row) => (
               <div key={row.stepIndex} style={{ marginBottom: 10 }}>
@@ -336,13 +409,14 @@ export default function SequencesPage() {
                 {row.resolved.length === 0 && <div style={{ color: '#999' }}>无占位符</div>}
                 {row.resolved.map((x) => (
                   <div key={x.key} style={{ fontSize: 13 }}>
-                    <code>{`{${x.key}}`}</code> = {x.value} <span className="badge">{x.source === 'default' ? 'default' : x.source}</span>
+                    <code>{`{${x.key}}`}</code> = {x.value} <span className="badge">{x.source}</span>
                   </div>
                 ))}
               </div>
             ))}
+            {startMsg && <div className="err">{startMsg}</div>}
             <div className="form-row">
-              {!isViewer && <button className="primary" onClick={start}>确认启动</button>}
+              {!isViewer && <button className="primary" onClick={start} disabled={starting}>确认启动</button>}
               <button onClick={() => setShowPreview(false)}>关闭</button>
             </div>
           </div>
@@ -362,7 +436,7 @@ export default function SequencesPage() {
               {run.steps.map((s) => (
                 <tr key={s.index}>
                   <td>{s.index}</td>
-                  <td><span className={`badge ${s.status === 'sent' || s.status === 'accepted' ? 'green' : s.status === 'failed' ? 'red' : ''}`}>{s.status}</span></td>
+                  <td><span className={`badge ${statusBadgeClass(s.status)}`}>{s.status}</span></td>
                   <td>{s.scheduledAt ?? '-'} / {s.sentAt ?? '-'}</td>
                   <td>{s.clientMsgId ?? '-'}</td>
                   <td style={{ fontSize: 12 }}>

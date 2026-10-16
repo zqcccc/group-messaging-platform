@@ -59,6 +59,11 @@ export async function createOutbound(
   if (acc.rows.length > 0 && acc.rows[0].status === 'rate_limited') {
     const until = acc.rows[0].rate_limited_until;
     if (until === null || new Date(until).getTime() > Date.now()) {
+      try {
+        await emit('message', { groupId, msgId: clientMsgId, isOwn: true });
+      } catch {
+        // 事件落库失败不影响主流程。
+      }
       return { clientMsgId, deliveryStatus: 'queued' };
     }
   }

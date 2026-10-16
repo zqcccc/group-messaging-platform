@@ -78,15 +78,26 @@ export class ApiError extends Error {
   code: string;
   stepIndex?: number;
   key?: string;
+  requestId?: string;
   isNetwork: boolean;
-  constructor(status: number, code: string, message: string, extra?: { stepIndex?: number; key?: string; isNetwork?: boolean }) {
+  constructor(status: number, code: string, message: string, extra?: { stepIndex?: number; key?: string; requestId?: string; isNetwork?: boolean }) {
     super(message);
     this.status = status;
     this.code = code;
     this.stepIndex = extra?.stepIndex;
     this.key = extra?.key;
+    this.requestId = extra?.requestId;
     this.isNetwork = extra?.isNetwork ?? false;
   }
+}
+
+// 统一错误文案：ApiError 带业务码与请求追踪，普通 Error 直接取 message
+export function formatError(e: unknown, fallback = '操作失败'): string {
+  if (e instanceof ApiError) {
+    return `${e.message}（${e.code}${e.requestId ? `，req:${e.requestId.slice(0, 8)}` : ''}）`;
+  }
+  if (e instanceof Error) return e.message;
+  return fallback;
 }
 
 async function toApiError(res: Response): Promise<ApiError> {
@@ -94,6 +105,7 @@ async function toApiError(res: Response): Promise<ApiError> {
   let message = res.statusText;
   let stepIndex: number | undefined;
   let key: string | undefined;
+  let requestId: string | undefined;
   try {
     const body = await res.json();
     if (body?.error) {
@@ -101,9 +113,10 @@ async function toApiError(res: Response): Promise<ApiError> {
       message = body.error.message ?? message;
       stepIndex = body.error.stepIndex;
       key = body.error.key;
+      if (typeof body.error.requestId === 'string') requestId = body.error.requestId;
     }
   } catch { /* 非 JSON 错误体：保留默认 */ }
-  return new ApiError(res.status, code, message, { stepIndex, key });
+  return new ApiError(res.status, code, message, { stepIndex, key, requestId });
 }
 
 function networkError(): ApiError {
@@ -148,7 +161,7 @@ export function roleFromToken(t: string | null): string | null {
 
 // 并发只发一次 refresh：所有同时 401 的请求共享同一个 refreshTask
 let refreshTask: Promise<string> | null = null;
-function refreshOnce(): Promise<string> {
+export function refreshOnce(): Promise<string> {
   if (!refreshTask) {
     refreshTask = (async () => {
       let res: Response;

@@ -185,12 +185,14 @@ async function handleMessageSent(d: Record<string, unknown>): Promise<void> {
     await emitInconsistency('MALFORMED_EVENT', clientMsgId ?? '-', 'message_sent 事件缺字段，已跳过');
     return;
   }
-  const r = await getPool().query(
+  const r = await getPool().query<{ group_id: string }>(
     `UPDATE outbound_messages SET delivery_status = 'sent', gateway_msg_id = $2, gateway_sent_at = $3
-     WHERE client_msg_id = $1`,
+     WHERE client_msg_id = $1 RETURNING group_id`,
     [clientMsgId, msgId, sentAt],
   );
-  if ((r.rowCount ?? 0) === 0) {
+  if (r.rows.length > 0) {
+    await emit('message', { groupId: r.rows[0].group_id, msgId, isOwn: true });
+  } else {
     await emitInconsistency('OUTBOUND_NOT_FOUND', clientMsgId, `message_sent 无对应出站行 ${clientMsgId}`);
   }
 }
@@ -224,6 +226,7 @@ async function handleMessageFailed(d: Record<string, unknown>): Promise<void> {
       `UPDATE outbound_messages SET delivery_status = 'failed', fail_code = $2 WHERE client_msg_id = $1`,
       [clientMsgId, code],
     );
+    await emit('message', { groupId, msgId: clientMsgId, isOwn: true });
     await markGroupUnreachable(groupId);
     return;
   }
@@ -237,6 +240,7 @@ async function handleMessageFailed(d: Record<string, unknown>): Promise<void> {
     `UPDATE outbound_messages SET delivery_status = 'failed', fail_code = $2 WHERE client_msg_id = $1`,
     [clientMsgId, code],
   );
+  await emit('message', { groupId, msgId: clientMsgId, isOwn: true });
 }
 
 // member_joined：服务账号落成员行（role 缺省 member，冲突忽略）；外部用户忽略。
@@ -256,6 +260,7 @@ async function handleMemberJoined(d: Record<string, unknown>): Promise<void> {
      VALUES ($1, $2, $3, 'member') ON CONFLICT (group_id, account_id) DO NOTHING`,
     [groupId, acc.rows[0].id, platformUserId],
   );
+  await emit('group_updated', { groupId });
 }
 
 // member_left：删对应服务账号成员行（外部用户本就没有行，自然无操作）。
@@ -270,6 +275,7 @@ async function handleMemberLeft(d: Record<string, unknown>): Promise<void> {
     groupId,
     platformUserId,
   ]);
+  await emit('group_updated', { groupId });
 }
 
 // account_status：相同状态静默忽略，否则走转移（含终态副作用）。
