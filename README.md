@@ -88,7 +88,7 @@ access token 有效期 15 分钟，过期前端自动用 HttpOnly cookie 续期�
 
 1. 登录（`/login`）：`admin/admin` 登录；`viewer` 登录后写按钮全部隐藏。
 2. 账号列表（`/accounts`）：状态徽 + 限流倒计时；`标记离线`（→ `disconnected`，online / rate_limited 可用）、`释放账号`（→ `idle`，online / disconnected 可用）、`重连`（idle / disconnected → online）；终态置灰不可操作；CAS 冲突提示刷新。
-3. 群组（`/groups`）→ 群详情（`/groups/:id`）：建群表单（创建者 + 成员，异步 job 轮询）→ 成员列表（含 role 徽）→ 消息时间线（“加载更早”链式翻页、实时追加、自发消息 `deliveryStatus` 徽）→ 最近 agent run 列表（`blocked` 红底醒目）→ 群内发送 + `agentEnabled/autoKickEnabled` 开关。
+3. 群组（`/groups`）→ 群详情（`/groups/:id`）：建群表单（创建者 + 成员，异步 job 轮询）→ 成员列表（含 role 徽）+ 全员退群（`leave-all`）→ 消息时间线（“加载更早”链式翻页与滚动补偿、实时追加、自发消息 `deliveryStatus` 徽）→ 最近 agent run 列表（`blocked` 红底醒目）与运行中序列深链 → 群内发送 + `agentEnabled/autoKickEnabled` 开关。
 4. Agent 运行详情（`/agent-runs/:id`）：每步 `kind`/工具名/入参/`resultSummary`/审计结论/错误码；协议错误步可展开 2KB 原始响应。
 5. 序列运行（`/sequences`）：下拉选序列（`GET /api/sequences`），或用页内“新建序列”表单（`POST /api/sequences`）创建后自动选中 → 填 `vars`（JSON 或 `key=value` 每行）与 `stepVars`（JSON）→ 本地预检弹窗（每步 key 取值与 `default`/`step:N` 来源）→ 启动；缺 key 时后端 `422` 会显示 `stepIndex` 与 `key`；运行中进度条 + 每步状态/时间。
 

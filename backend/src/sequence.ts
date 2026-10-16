@@ -7,6 +7,7 @@ import { requireAdmin, requireAuth } from './auth';
 import { getPool, withTransaction } from './db';
 import { DeliveryOutcome, deliverMessage, markRowSent, outcomeOfRow, pollLanding, readOutboundRow } from './send';
 import { asyncHandler, sendError } from './util';
+const EVT_SEQUENCE_RUN = 'sequence_run';
 
 // ---------- 小工具 ----------
 
@@ -78,6 +79,7 @@ function effectiveVars(
 function renderText(text: string, values: StrMap): string {
   return text.replace(/\{([A-Za-z0-9_]+)\}/g, (m, k: string) => (k in values ? values[k] : m));
 }
+
 
 // ---------- 序列步骤状态 ----------
 
@@ -175,7 +177,7 @@ async function saveSeqRun(runId: string, steps: SeqStepState[], extra?: { status
 }
 
 async function emitSeqRun(runId: string, groupId: string, status: string, currentStepIndex: number): Promise<void> {
-  await emitWs('sequence_run', { runId, groupId, status, currentStepIndex });
+  await emitWs(EVT_SEQUENCE_RUN, { runId, groupId, status, currentStepIndex });
 }
 
 // ---------- 账号选择 ----------

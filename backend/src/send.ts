@@ -36,13 +36,18 @@ export async function applyRateLimited(accountId: string, retryAfterSeconds: num
   if (from === 'suspended' || from === 'session_expired') return;
   const secs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0 ? Math.ceil(retryAfterSeconds) : 60;
   // 转移表上只有 online → rate_limited；已是 rate_limited 时只刷新 rateLimitedUntil（不算转移，不推事件）。
-  const upd = await pool.query(
+  const upd = await pool.query<{ rate_limited_until: Date | string | null }>(
     `UPDATE accounts SET status = 'rate_limited', rate_limited_until = now() + ($2 || ' seconds')::interval
-     WHERE id = $1 AND status IN ('online', 'rate_limited')`,
+     WHERE id = $1 AND status IN ('online', 'rate_limited') RETURNING rate_limited_until`,
     [accountId, String(secs)],
   );
   if ((upd.rowCount ?? 0) === 0) return;
-  if (from !== 'rate_limited') await emitSafe('account_status_changed', { accountId, from, to: 'rate_limited' });
+  const untilRaw = upd.rows[0]?.rate_limited_until;
+  const rateLimitedUntil =
+    untilRaw instanceof Date ? untilRaw.toISOString() : untilRaw != null ? String(untilRaw) : null;
+  if (from !== 'rate_limited') {
+    await emitSafe('account_status_changed', { accountId, from, to: 'rate_limited', rateLimitedUntil });
+  }
   scheduleRateLimitRecovery(accountId, secs * 1000);
 }
 
@@ -58,7 +63,7 @@ export function scheduleRateLimitRecovery(accountId: string, delayMs: number): v
           [accountId],
         );
         if ((r.rowCount ?? 0) > 0) {
-          await emitSafe('account_status_changed', { accountId, from: 'rate_limited', to: 'online' });
+          await emitSafe('account_status_changed', { accountId, from: 'rate_limited', to: 'online', rateLimitedUntil: null });
           await flushQueuedForAccount(accountId);
         }
       } catch {
@@ -81,7 +86,10 @@ export async function applyTerminal(accountId: string, to: 'suspended' | 'sessio
 
 // 群不可写：群置 unreachable（账号状态不变）。
 export async function markGroupUnreachable(groupId: string): Promise<void> {
-  await getPool().query(`UPDATE groups SET status = 'unreachable' WHERE id = $1 AND status = 'active'`, [groupId]);
+  const r = await getPool().query(`UPDATE groups SET status = 'unreachable' WHERE id = $1 AND status = 'active'`, [groupId]);
+  if ((r.rowCount ?? 0) > 0) {
+    await emitSafe('group_updated', { groupId, status: 'unreachable' });
+  }
 }
 
 // ---------- 出站行读写 ----------
@@ -273,10 +281,12 @@ async function settleUnknown(ctx: SendCtx, timeoutAt: number, maxWaitMs: number)
   }
   if (r !== 'absent') {
     await markRowSent(ctx.clientMsgId, r.msgId, r.sentAt);
+    await emitSafe('message', { groupId: ctx.groupId, msgId: ctx.clientMsgId, isOwn: true });
     return { kind: 'sent', clientMsgId: ctx.clientMsgId, msgId: r.msgId, sentAt: r.sentAt };
   }
   if (await claimResend(ctx.clientMsgId)) return await sendToGateway(ctx, true);
   await markRowFailed(ctx.clientMsgId, 'NETWORK_TIMEOUT');
+  await emitSafe('message', { groupId: ctx.groupId, msgId: ctx.clientMsgId, isOwn: true });
   return { kind: 'failed', clientMsgId: ctx.clientMsgId, code: 'NETWORK_TIMEOUT' };
 }
 
@@ -293,6 +303,7 @@ async function sendToGateway(ctx: SendCtx, isResend: boolean): Promise<DeliveryO
       await pool.query(`UPDATE outbound_messages SET delivery_status = 'unknown' WHERE client_msg_id = $1`, [
         clientMsgId,
       ]);
+      await emitSafe('message', { groupId: ctx.groupId, msgId: clientMsgId, isOwn: true });
       return await settleUnknown(ctx, Date.now(), Math.max(2500, Math.min(ctx.confirmMs, 5000)));
     }
     if (code === 'ACCOUNT_SUSPENDED' || code === 'SESSION_EXPIRED') {
@@ -303,15 +314,18 @@ async function sendToGateway(ctx: SendCtx, isResend: boolean): Promise<DeliveryO
          WHERE client_msg_id = $1`,
         [clientMsgId],
       );
+      await emitSafe('message', { groupId: ctx.groupId, msgId: clientMsgId, isOwn: true });
       return { kind: 'terminal', clientMsgId, terminal };
     }
     if (code === 'GROUP_WRITE_FORBIDDEN') {
       await markRowFailed(clientMsgId, code);
+      await emitSafe('message', { groupId: ctx.groupId, msgId: clientMsgId, isOwn: true });
       await markGroupUnreachable(ctx.groupId);
       return { kind: 'group_forbidden', clientMsgId, code };
     }
     if (code === 'SENDER_NOT_IN_GROUP' || code === 'ACCOUNT_OFFLINE') {
       await markRowFailed(clientMsgId, code);
+      await emitSafe('message', { groupId: ctx.groupId, msgId: clientMsgId, isOwn: true });
       return { kind: 'failed', clientMsgId, code };
     }
     if (code === 'RATE_LIMITED') {
@@ -326,6 +340,7 @@ async function sendToGateway(ctx: SendCtx, isResend: boolean): Promise<DeliveryO
     if (isResend) {
       // 唯一一次重发也没被受理 → 确定没有发出。
       await markRowFailed(clientMsgId, 'NETWORK_TIMEOUT');
+      await emitSafe('message', { groupId: ctx.groupId, msgId: clientMsgId, isOwn: true });
       return { kind: 'failed', clientMsgId, code: 'NETWORK_TIMEOUT' };
     }
     // 503 RETRYABLE 等：网关没收下，行退回 queued，调用方稍后重试。
@@ -333,9 +348,11 @@ async function sendToGateway(ctx: SendCtx, isResend: boolean): Promise<DeliveryO
     return { kind: 'retry_later', clientMsgId, code };
   }
   await markRowAccepted(clientMsgId);
+  await emitSafe('message', { groupId: ctx.groupId, msgId: clientMsgId, isOwn: true });
   const landed = await pollLanding(ctx.gatewayGroupId, clientMsgId, ctx.confirmMs);
   if (landed) {
     await markRowSent(clientMsgId, landed.msgId, landed.sentAt);
+    await emitSafe('message', { groupId: ctx.groupId, msgId: clientMsgId, isOwn: true });
     return { kind: 'sent', clientMsgId, msgId: landed.msgId, sentAt: landed.sentAt };
   }
   return { kind: 'timeout', clientMsgId };
@@ -433,6 +450,7 @@ export async function createOutbound(
     const cur = await readOutboundRow(clientMsgId);
     return { clientMsgId, deliveryStatus: publicDeliveryStatus(cur?.delivery_status ?? 'unknown') };
   }
+  await emitSafe('message', { groupId, msgId: clientMsgId, isOwn: true });
   const delivery = deliverMessage({
     groupId,
     gatewayGroupId: g.rows[0].gateway_group_id,

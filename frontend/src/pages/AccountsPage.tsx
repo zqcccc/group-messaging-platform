@@ -1,28 +1,41 @@
 import { useCallback, useEffect, useState } from 'react';
-import { ApiError, fetchJson, postJson, type Account } from '../api';
+import { ApiError, fetchJson, formatError, postJson, type Account } from '../api';
 import { useAuth } from '../auth';
 import { useWs } from '../ws';
 import { ReadOnlyNote } from '../components/ui';
 
+// 账号状态常量
+const STATUS_IDLE = 'idle';
+const STATUS_ONLINE = 'online';
+const STATUS_RATE_LIMITED = 'rate_limited';
+const STATUS_DISCONNECTED = 'disconnected';
+const STATUS_SUSPENDED = 'suspended';
+const STATUS_SESSION_EXPIRED = 'session_expired';
+// WS 事件类型常量
+const EVT_STATUS_CHANGED = 'account_status_changed';
+const EVT_TERMINAL = 'account_terminal';
+const CAS_CONFLICT_CODE = 'CAS_CONFLICT';
+const POLL_INTERVAL_MS = 10_000;
+
 // A1 转移表（前端镜像，仅控制按钮显隐；真实校验在后端）
 const LEGAL_NEXT: Record<string, string[]> = {
-  idle: ['online', 'suspended', 'session_expired'],
-  online: ['idle', 'rate_limited', 'disconnected', 'suspended', 'session_expired'],
-  rate_limited: ['online', 'disconnected', 'suspended', 'session_expired'],
-  disconnected: ['idle', 'online', 'suspended', 'session_expired'],
-  suspended: [],
-  session_expired: [],
+  [STATUS_IDLE]: [STATUS_ONLINE, STATUS_SUSPENDED, STATUS_SESSION_EXPIRED],
+  [STATUS_ONLINE]: [STATUS_IDLE, STATUS_RATE_LIMITED, STATUS_DISCONNECTED, STATUS_SUSPENDED, STATUS_SESSION_EXPIRED],
+  [STATUS_RATE_LIMITED]: [STATUS_ONLINE, STATUS_DISCONNECTED, STATUS_SUSPENDED, STATUS_SESSION_EXPIRED],
+  [STATUS_DISCONNECTED]: [STATUS_IDLE, STATUS_ONLINE, STATUS_SUSPENDED, STATUS_SESSION_EXPIRED],
+  [STATUS_SUSPENDED]: [],
+  [STATUS_SESSION_EXPIRED]: [],
 };
 
 // 终态置灰
 function isTerminal(status: string) {
-  return status === 'suspended' || status === 'session_expired';
+  return status === STATUS_SUSPENDED || status === STATUS_SESSION_EXPIRED;
 }
 
 function statusBadge(status: string) {
-  if (status === 'online') return <span className="badge green">online</span>;
+  if (status === STATUS_ONLINE) return <span className="badge green">{STATUS_ONLINE}</span>;
   if (isTerminal(status)) return <span className="badge gray">{status}</span>;
-  if (status === 'rate_limited') return <span className="badge orange">rate_limited</span>;
+  if (status === STATUS_RATE_LIMITED) return <span className="badge orange">{STATUS_RATE_LIMITED}</span>;
   return <span className="badge">{status}</span>;
 }
 
@@ -47,6 +60,8 @@ export default function AccountsPage() {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [err, setErr] = useState('');
   const [notice, setNotice] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [busyId, setBusyId] = useState('');
 
   const load = useCallback(async () => {
     try {
@@ -54,52 +69,71 @@ export default function AccountsPage() {
       setAccounts(data);
       setErr('');
     } catch (e) {
-      setErr(e instanceof ApiError ? `${e.message}（${e.code}）` : '加载失败');
+      setErr(formatError(e, '加载失败'));
+    } finally {
+      setLoading(false);
     }
   }, []);
 
   useEffect(() => {
     load();
-    const t = setInterval(load, 10_000); // 兜底轮询
+    const t = setInterval(load, POLL_INTERVAL_MS); // 兜底轮询
     return () => clearInterval(t);
   }, [load]);
 
   // WS 实时更新状态；account_terminal 到达时刷新整表（附带后果需重拉）
-  useWs(['account_status_changed', 'account_terminal'], (f) => {
-    const p = f.payload as { accountId?: string; from?: string; to?: string; status?: string };
+  useWs([EVT_STATUS_CHANGED, EVT_TERMINAL], (f) => {
+    const p = f.payload as { accountId?: string; from?: string; to?: string; status?: string; rateLimitedUntil?: string | null };
     if (!p.accountId) return;
-    if (f.type === 'account_terminal') {
+    if (f.type === EVT_TERMINAL) {
       load();
       return;
     }
     const to = (p.to ?? p.status) as string | undefined;
     if (!to) return;
-    setAccounts((prev) => prev.map((a) => (a.id === p.accountId ? { ...a, status: to } : a)));
+    if (to === STATUS_RATE_LIMITED && p.rateLimitedUntil === undefined) {
+      // 缺少限流截止时间时重拉整表，确保倒计时准确
+      load();
+    }
+    setAccounts((prev) => prev.map((a) => {
+      if (a.id !== p.accountId) return a;
+      const next: Account = { ...a, status: to };
+      if (to === STATUS_RATE_LIMITED && typeof p.rateLimitedUntil !== 'undefined') {
+        next.rateLimitedUntil = p.rateLimitedUntil;
+      }
+      return next;
+    }));
   });
 
   const doConnect = async (a: Account) => {
     setNotice('');
+    setBusyId(a.id);
     try {
       await postJson<{ status: string; platformUserId: string }>(`/api/accounts/${a.id}/connect`);
       load();
     } catch (e) {
-      setNotice(e instanceof ApiError ? `重连失败：${e.message}（${e.code}）` : '重连失败');
+      setNotice(`重连失败：${formatError(e)}`);
+    } finally {
+      setBusyId('');
     }
   };
 
   // 手动标记状态：带 expectedFrom（CAS）；CAS_CONFLICT 提示刷新
   const doTransition = async (a: Account, to: string) => {
     setNotice('');
+    setBusyId(a.id);
     try {
       await postJson(`/api/accounts/${a.id}/transition`, { to, expectedFrom: a.status });
       load();
     } catch (e) {
-      if (e instanceof ApiError && e.code === 'CAS_CONFLICT') {
-        setNotice(`账号 ${a.id} 状态已变化，请刷新后重试（CAS_CONFLICT）`);
+      if (e instanceof ApiError && e.code === CAS_CONFLICT_CODE) {
+        setNotice(`账号 ${a.id} 状态已变化，请刷新后重试（${CAS_CONFLICT_CODE}）`);
         load();
       } else {
-        setNotice(e instanceof ApiError ? `操作失败：${e.message}（${e.code}）` : '操作失败');
+        setNotice(`操作失败：${formatError(e)}`);
       }
+    } finally {
+      setBusyId('');
     }
   };
 
@@ -110,28 +144,31 @@ export default function AccountsPage() {
   const renderActions = (a: Account) => {
     if (isViewer || isTerminal(a.status)) return <span style={{ color: '#999' }}>{isTerminal(a.status) ? '终态，不可操作' : ''}</span>;
     const next = LEGAL_NEXT[a.status] ?? [];
+    const busy = busyId === a.id;
     return (
       <>
-        {next.includes('disconnected') && (
-          <button onClick={() => doTransition(a, 'disconnected')}>标记离线</button>
+        {next.includes(STATUS_DISCONNECTED) && (
+          <button onClick={() => doTransition(a, STATUS_DISCONNECTED)} disabled={busy}>标记离线</button>
         )}
-        {next.includes('idle') && (
-          <button onClick={() => doTransition(a, 'idle')}>释放账号</button>
+        {next.includes(STATUS_IDLE) && (
+          <button onClick={() => doTransition(a, STATUS_IDLE)} disabled={busy}>释放账号</button>
         )}
-        {(a.status === 'disconnected' || a.status === 'idle') && (
-          <button className="primary" onClick={() => doConnect(a)}>重连</button>
+        {(a.status === STATUS_DISCONNECTED || a.status === STATUS_IDLE) && (
+          <button className="primary" onClick={() => doConnect(a)} disabled={busy}>重连</button>
         )}
       </>
     );
   };
+
+  if (loading) return <div className="card">加载中…</div>;
 
   return (
     <div>
       <ReadOnlyNote />
       <div className="card">
         <h3>账号列表</h3>
-        {err && <div className="err">{err}</div>}
-        {notice && <div className="note">{notice}</div>}
+        {err && <div className="err">{err} <button className="btn-sm" onClick={() => { setLoading(true); load(); }}>重试</button></div>}
+        {notice && <div className="note">{notice} <button className="btn-sm" onClick={() => setNotice('')}>关闭</button></div>}
         <table className="list">
           <thead>
             <tr><th>账号</th><th>状态</th><th>平台用户</th><th>限流</th><th>操作</th></tr>
@@ -143,7 +180,7 @@ export default function AccountsPage() {
                 <td>{statusBadge(a.status)}</td>
                 <td>{a.platformUserId ?? '-'}</td>
                 <td>
-                  {a.status === 'rate_limited' && a.rateLimitedUntil
+                  {a.status === STATUS_RATE_LIMITED && a.rateLimitedUntil
                     ? <RateCountdown until={a.rateLimitedUntil} />
                     : '-'}
                 </td>
