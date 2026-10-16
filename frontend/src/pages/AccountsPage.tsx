@@ -103,19 +103,20 @@ export default function AccountsPage() {
     }
   };
 
-  // 三个按钮的显示规则（需求命名）：
-  // online → “标记离线”（online→idle）、“释放账号”（online→disconnected）
-  // disconnected/idle → “重连”（走 connect 接口回到 online）
+  // 三个按钮按转移表显示：
+  // “标记离线” → disconnected（online / rate_limited 可用；题意 A1：限流到期时“已被操作员标记离线”则不再转回 online）
+  // “释放账号” → idle（回到初始未占用状态；online / disconnected 可用）
+  // “重连”     → 走 connect 接口回到 online（idle / disconnected 可用）
   const renderActions = (a: Account) => {
     if (isViewer || isTerminal(a.status)) return <span style={{ color: '#999' }}>{isTerminal(a.status) ? '终态，不可操作' : ''}</span>;
     const next = LEGAL_NEXT[a.status] ?? [];
     return (
       <>
-        {a.status === 'online' && next.includes('idle') && (
-          <button onClick={() => doTransition(a, 'idle')}>标记离线</button>
+        {next.includes('disconnected') && (
+          <button onClick={() => doTransition(a, 'disconnected')}>标记离线</button>
         )}
-        {a.status === 'online' && next.includes('disconnected') && (
-          <button onClick={() => doTransition(a, 'disconnected')}>释放账号</button>
+        {next.includes('idle') && (
+          <button onClick={() => doTransition(a, 'idle')}>释放账号</button>
         )}
         {(a.status === 'disconnected' || a.status === 'idle') && (
           <button className="primary" onClick={() => doConnect(a)}>重连</button>

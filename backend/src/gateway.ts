@@ -1,6 +1,6 @@
 // 网关 HTTP 客户端：connect/disconnect/send/join/invite/promote/kick/leave/members/by-client-id。
 // 所有失败统一抛 GatewayError{httpStatus, code, retryAfterSeconds}；任意端点 503 的 code 固定为 RETRYABLE。
-// groups.ts 内联了自己的最小客户端，本文件供 send/agent/sequence 与后续替换使用。
+// 后端所有模块共用这一个网关客户端。
 
 // 结构化网关错误：httpStatus 为 HTTP 状态码（不可达时为 0），code 为网关业务码。
 export class GatewayError extends Error {

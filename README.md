@@ -35,6 +35,8 @@ node verify/run-all.mjs              # 一键跑 S1–S8 + 补充用例，打印
 | X2 | 账号状态机：404 / 400 / ILLEGAL_TRANSITION / CAS_CONFLICT / 并发转移，以及 WS `account_status_changed` 推送 |
 | X3 | 不同 agent run 复用同一个 `idempotency_key` 时，两条消息都要发出 |
 | X4 | 504 后 by-client-id 查询也不可用：保持 `unknown`、不重发，查询恢复后收敛 |
+| X5 | 后端在等网关 202 时被 `kill -9`：重启后确认到已发出 → `sent`，网关里恰好一条（需用 `scripts/start-all.sh` 启动后端） |
+| X6 | 账号进终态时，它排队中的序列步骤在同一事务里 `skipped`，下一步随即发出。**会把 acc-3 永久变成终态**，默认不跑，需点名：`node verify/run-all.mjs X6`，跑完用 `--fresh` 重启 |
 
 ### 端到端（C3，Playwright）
 
@@ -85,7 +87,7 @@ access token 有效期 15 分钟，过期前端自动用 HttpOnly cookie 续期�
 ## 前端 5 页面操作路径（已对真实后端验证通过）
 
 1. 登录（`/login`）：`admin/admin` 登录；`viewer` 登录后写按钮全部隐藏。
-2. 账号列表（`/accounts`）：状态徽 + 限流倒计时；`online → 标记离线/释放账号`，`idle/disconnected → 重连`；终态置灰不可操作；CAS 冲突提示刷新。
+2. 账号列表（`/accounts`）：状态徽 + 限流倒计时；`标记离线`（→ `disconnected`，online / rate_limited 可用）、`释放账号`（→ `idle`，online / disconnected 可用）、`重连`（idle / disconnected → online）；终态置灰不可操作；CAS 冲突提示刷新。
 3. 群组（`/groups`）→ 群详情（`/groups/:id`）：建群表单（创建者 + 成员，异步 job 轮询）→ 成员列表（含 role 徽）→ 消息时间线（“加载更早”链式翻页、实时追加、自发消息 `deliveryStatus` 徽）→ 最近 agent run 列表（`blocked` 红底醒目）→ 群内发送 + `agentEnabled/autoKickEnabled` 开关。
 4. Agent 运行详情（`/agent-runs/:id`）：每步 `kind`/工具名/入参/`resultSummary`/审计结论/错误码；协议错误步可展开 2KB 原始响应。
 5. 序列运行（`/sequences`）：下拉选序列（`GET /api/sequences`），或用页内“新建序列”表单（`POST /api/sequences`）创建后自动选中 → 填 `vars`（JSON 或 `key=value` 每行）与 `stepVars`（JSON）→ 本地预检弹窗（每步 key 取值与 `default`/`step:N` 来源）→ 启动；缺 key 时后端 `422` 会显示 `stepIndex` 与 `key`；运行中进度条 + 每步状态/时间。

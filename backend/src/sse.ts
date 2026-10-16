@@ -1,12 +1,12 @@
 // 网关 SSE 消费：长连接拉取、去重、断线补拉。
-// groups.ts 经动态 require 取 subscribeMemberEvents（成员等待的提前唤醒）；
-// 本文件绝不 import groups.ts，避免循环依赖。
+// groups.ts 订阅 subscribeMemberEvents 做成员等待的提前唤醒；本文件不 import groups.ts，避免循环依赖。
 import { applyAccountTransition } from './accounts';
+import { onInboundMessage } from './agent';
 import { getPool } from './db';
-import { applyRateLimited, applyTerminal, markGroupUnreachable } from './sequence';
+import { applyRateLimited, applyTerminal, markGroupUnreachable } from './send';
 import { emit, emitInconsistency } from './ws';
 
-// groups.ts 动态 require 的成员事件形状（调用方按宽形状接收）。
+// 成员事件（groups.ts 订阅）。
 export interface MemberEvent {
   gatewayGroupId: string;
   platformUserId: string;
@@ -79,12 +79,6 @@ async function groupIdByGateway(gatewayGroupId: string): Promise<string | null> 
   return r.rows.length > 0 ? r.rows[0].id : null;
 }
 
-// agent 触发函数签名（动态模块无法静态校验，调用前已做 typeof 检查）。
-type OnInboundMessage = (
-  groupId: string,
-  msg: { msgId: string; senderPlatformUserId: string; text: string; sentAt: string },
-) => Promise<unknown> | unknown;
-
 // 自发回流的出站关联（顶层函数，供 handleMessage 调用）。
 // 两种到达顺序都要合为一行：
 // message_sent 先到时行上已有 gateway_msg_id=msgId，直接找回 clientMsgId；
@@ -104,7 +98,7 @@ async function linkOwnOutbound(
   const cand = await pool.query<{ client_msg_id: string }>(
     `SELECT client_msg_id FROM outbound_messages
      WHERE group_id = $1 AND account_id IN (SELECT id FROM accounts WHERE platform_user_id = $2)
-       AND gateway_msg_id IS NULL AND delivery_status IN ('queued', 'accepted', 'unknown')
+       AND gateway_msg_id IS NULL AND delivery_status IN ('queued', 'sending', 'accepted', 'unknown')
      ORDER BY created_at ASC LIMIT 1`,
     [groupId, sender],
   );
@@ -158,21 +152,8 @@ async function handleMessage(d: Record<string, unknown>): Promise<void> {
     await emit('message', { groupId, msgId, isOwn: true });
     return;
   }
-  // 非 own：触发 agent（agent.ts 未落地时跳过），再推 WS。
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const mod: unknown = require('./agent.js');
-    if (typeof mod === 'object' && mod !== null && 'onInboundMessage' in mod) {
-      const fn: unknown = mod.onInboundMessage;
-      if (typeof fn === 'function') {
-        // fn 已做 typeof 检查；签名按 agent.ts 约定断言（动态模块无法静态校验）。
-        const onInbound = fn as OnInboundMessage;
-        await onInbound(groupId, { msgId, senderPlatformUserId: sender, text, sentAt });
-      }
-    }
-  } catch {
-    // agent 未落地或触发失败：消息已入库，仅跳过触发。
-  }
+  // 非 own：触发 agent（异步执行，失败只打日志，消息已入库），再推 WS。
+  onInboundMessage(groupId, { msgId, senderPlatformUserId: sender, text, sentAt });
   await emit('message', { groupId, msgId, isOwn: false });
 }
 

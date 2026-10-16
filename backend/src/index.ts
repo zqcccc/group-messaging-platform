@@ -1,12 +1,14 @@
 // 服务组装与启动：先校验 schema 版本（落后拒绝启动），再挂路由，最后监听。
 import express, { NextFunction, Request, Response } from 'express';
 import { accountsRouter } from './accounts';
-import { agentRouter } from './agent';
+import { agentRouter, resumeAgentRuns } from './agent';
 import { authRouter } from './auth';
-import { groupsRouter, jobsRouter } from './groups';
-import { sequenceRouter } from './sequence';
-import { messagesRouter } from './timeline';
 import { assertSchemaVersion, CODE_SCHEMA_VERSION, ensureSeed } from './db';
+import { groupsRouter, jobsRouter } from './groups';
+import { resumeOutbound } from './send';
+import { resumeSequenceRuns, sequenceRouter } from './sequence';
+import { startSse } from './sse';
+import { messagesRouter } from './timeline';
 import { requestIdMiddleware, sendError } from './util';
 import { attachWs, startWsBroadcaster } from './ws';
 
@@ -50,39 +52,20 @@ async function main(): Promise<void> {
   });
   attachWs(server);
   startWsBroadcaster();
-  // 恢复链：兄弟模块落地顺序不定，静态 import 会在构建/启动期直接失败；
-  // 故用动态 require，缺失或异常只打日志不崩进程。
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const sse = require('./sse.js') as { startSse?: unknown };
-    if (typeof sse.startSse === 'function') (sse.startSse as () => void)();
-    else console.error('[index] sse.startSse 缺失，跳过 SSE 恢复');
-  } catch (e) {
-    console.error('[index] sse 恢复失败:', e instanceof Error ? e.message : e);
-  }
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const send = require('./send.js') as { resumeOutbound?: unknown };
-    if (typeof send.resumeOutbound === 'function') await (send.resumeOutbound as () => Promise<void>)();
-    else console.error('[index] send.resumeOutbound 缺失，跳过出站恢复');
-  } catch (e) {
-    console.error('[index] 出站恢复失败:', e instanceof Error ? e.message : e);
-  }
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const seq = require('./sequence.js') as { resumeSequenceRuns?: unknown };
-    if (typeof seq.resumeSequenceRuns === 'function') await (seq.resumeSequenceRuns as () => Promise<void>)();
-    else console.error('[index] sequence.resumeSequenceRuns 缺失，跳过序列恢复');
-  } catch (e) {
-    console.error('[index] 序列恢复失败:', e instanceof Error ? e.message : e);
-  }
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const agent = require('./agent.js') as { resumeAgentRuns?: unknown };
-    if (typeof agent.resumeAgentRuns === 'function') await (agent.resumeAgentRuns as () => Promise<void>)();
-    else console.error('[index] agent.resumeAgentRuns 缺失，跳过 agent 恢复');
-  } catch (e) {
-    console.error('[index] agent 恢复失败:', e instanceof Error ? e.message : e);
+  // 恢复链：事件流先接上，再恢复出站行（sending/unknown 收敛、排队补发），最后续跑序列与 agent run。
+  // 单个环节失败只打日志，不影响其余环节与已在服务的 HTTP。
+  startSse();
+  const steps: Array<[string, () => Promise<void>]> = [
+    ['出站', resumeOutbound],
+    ['序列', resumeSequenceRuns],
+    ['agent', resumeAgentRuns],
+  ];
+  for (const [name, resume] of steps) {
+    try {
+      await resume();
+    } catch (e) {
+      console.error(`[index] ${name}恢复失败:`, e instanceof Error ? e.message : e);
+    }
   }
 }
 
